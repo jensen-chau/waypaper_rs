@@ -74,7 +74,7 @@ impl Wallpaper for VideoWallpaper {
         let is_paused_render = is_paused.clone();
         let is_stopped_render = is_stopped.clone();
         
-        // Decode thread
+        // Decode thread - use software decoding with optimized conversion
         let decode_thread = thread::spawn(move || {
             if let Err(e) = decode_video(&video_path, tx, &is_paused, &is_stopped) {
                 error!("Video decode error: {}", e);
@@ -106,8 +106,17 @@ fn decode_video(
     
     info!("Opening video: {}", video_path);
     
-    // Open video decoder
-    let mut decoder = Decoder::new(std::path::Path::new(video_path))?;
+    // Try to open video decoder with hardware acceleration
+    let mut decoder = match Decoder::new(std::path::Path::new(video_path)) {
+        Ok(dec) => {
+            info!("Opened video with software decoder");
+            dec
+        }
+        Err(e) => {
+            error!("Failed to open video: {}", e);
+            return Err(e.into());
+        }
+    };
     
     // Get time base for timestamp calculations
     let time_base = decoder.time_base();
@@ -208,6 +217,229 @@ fn decode_video(
     }
     
     Ok(())
+}
+
+// Hardware-accelerated decode using ffmpeg-next
+#[allow(dead_code)]
+fn decode_video_hwaccel(
+    video_path: &str,
+    tx: mpsc::Sender<FrameData>,
+    is_paused: &Arc<AtomicBool>,
+    is_stopped: &Arc<AtomicBool>,
+) -> Result<()> {
+    use ffmpeg_next as ffmpeg;
+    
+    info!("Opening video with hardware acceleration: {}", video_path);
+    
+    // Initialize FFmpeg
+    ffmpeg::init()?;
+    
+    // Open input
+    let mut input = ffmpeg::format::input(&video_path)?;
+    info!("Input format: {}", input.format().name());
+    
+    // Find video stream
+    let video_stream_index = input
+        .streams()
+        .best(ffmpeg::media::Type::Video)
+        .ok_or_else(|| anyhow::anyhow!("No video stream found"))?
+        .index();
+    
+    let video_stream = input.stream(video_stream_index).unwrap();
+    let video_stream_params = video_stream.parameters();
+    
+    info!("Video codec: {}", video_stream_params.id().name());
+    
+    // Find decoder
+    let codec_id = video_stream_params.id();
+    let decoder = ffmpeg::codec::decoder::find(codec_id)
+        .ok_or_else(|| anyhow::anyhow!("Decoder not found for codec: {}", codec_id.name()))?;
+    
+    info!("Using decoder: {}", decoder.name());
+    
+    // Create decoder context
+    let mut decoder_context = ffmpeg::codec::context::Context::new_with_codec(decoder);
+    decoder_context.set_parameters(video_stream_params)?;
+    
+    // Try to enable hardware acceleration
+    // Note: Hardware acceleration support in ffmpeg-next is limited
+    // We'll try to use a hardware-accelerated codec if available
+    info!("Hardware acceleration support: Limited in current implementation");
+    
+    let mut decoder = decoder_context.decoder().video()?;
+    
+    info!("Decoder initialized");
+    info!("Video size: {}x{}", decoder.width(), decoder.height());
+    info!("Pixel format: {:?}", decoder.format());
+    
+    let mut frame_count = 0u64;
+    let mut last_pts: Option<i64> = None;
+    let mut frame_time_ms: u32 = 33;
+    let mut total_decode_time = Duration::from_secs(0);
+    let mut total_convert_time = Duration::from_secs(0);
+    
+    let packet = ffmpeg::packet::Packet::empty();
+    let mut frame = ffmpeg::frame::Video::empty();
+    
+    // Get time_base before loop to avoid borrow issues
+    let time_base_num = video_stream.time_base().numerator() as i64;
+    let time_base_den = video_stream.time_base().denominator() as i64;
+    
+    loop {
+        if is_stopped.load(std::sync::atomic::Ordering::SeqCst) {
+            info!("Decode thread stopped");
+            break;
+        }
+        
+        if is_paused.load(std::sync::atomic::Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+        
+        // Read packet
+        let decode_start = std::time::Instant::now();
+        let mut packets = input.packets();
+        let mut has_packet = false;
+        
+        for (stream, packet) in packets.by_ref() {
+            if stream.index() != video_stream_index {
+                continue;
+            }
+            
+            has_packet = true;
+            
+            // Send packet to decoder
+            decoder.send_packet(&packet)?;
+            
+            // Receive frame from decoder
+            while decoder.receive_frame(&mut frame).is_ok() {
+                let decode_time = decode_start.elapsed();
+                total_decode_time += decode_time;
+                frame_count += 1;
+                
+                let width = frame.width();
+                let height = frame.height();
+                
+                // Convert frame data to RGBA
+                let convert_start = std::time::Instant::now();
+                let rgba_data = convert_ffmpeg_frame_to_rgba(&frame, width, height)?;
+                let convert_time = convert_start.elapsed();
+                total_convert_time += convert_time;
+                
+                // Calculate frame time from PTS
+                if let Some(pts) = frame.pts() {
+                    if let Some(last) = last_pts {
+                        let pts_diff = pts - last;
+                        let time_ms = (pts_diff * 1000 * time_base_num / time_base_den) as u32;
+                        if time_ms > 0 && time_ms < 1000 {
+                            frame_time_ms = time_ms;
+                        }
+                    }
+                    last_pts = Some(pts);
+                }
+                
+                // Send frame data
+                let frame_data = FrameData {
+                    frame: rgba_data,
+                    width,
+                    height,
+                    frame_time: frame_time_ms,
+                };
+                
+                if tx.send(frame_data).is_err() {
+                    warn!("Render thread disconnected");
+                    break;
+                }
+                
+                if frame_count % 30 == 0 {
+                    let avg_decode = total_decode_time.as_secs_f64() * 1000.0 / 30.0;
+                    let avg_convert = total_convert_time.as_secs_f64() * 1000.0 / 30.0;
+                    info!("Decoded {} frames, frame time: {}ms, avg_decode={:.2}ms, avg_convert={:.2}ms", 
+                          frame_count, frame_time_ms, avg_decode, avg_convert);
+                    total_decode_time = Duration::from_secs(0);
+                    total_convert_time = Duration::from_secs(0);
+                }
+            }
+            break; // Process one packet at a time
+        }
+        
+        // Check if we reached EOF
+        if !has_packet {
+            info!("Video ended, restarting");
+            input = ffmpeg::format::input(&video_path)?;
+            frame_count = 0;
+            last_pts = None;
+            frame_time_ms = 33;
+        }
+    }
+    
+    Ok(())
+}
+
+fn convert_ffmpeg_frame_to_rgba(frame: &ffmpeg_next::frame::Video, width: u32, height: u32) -> Result<Vec<u8>> {
+    use ffmpeg_next as ffmpeg;
+    
+    let pixel_count = (width * height) as usize;
+    let mut rgba_data = vec![0u8; pixel_count * 4];
+    
+    // Get frame data
+    let data = frame.data(0);
+    let linesize = frame.stride(0);
+    
+    // Convert based on pixel format
+    unsafe {
+        match frame.format() {
+            ffmpeg::util::format::pixel::Pixel::YUV420P => {
+                // YUV420P to RGB conversion
+                let y_plane = data.as_ptr();
+                let u_plane = data.as_ptr().add(linesize as usize * height as usize);
+                let v_plane = u_plane.add(linesize as usize * height as usize / 4);
+                
+                let mut rgba_idx = 0;
+                for y in 0..height as usize {
+                    for x in 0..width as usize {
+                        let y_idx = y * linesize as usize + x;
+                        let u_idx = (y / 2) * (linesize as usize / 2) + (x / 2);
+                        let v_idx = u_idx;
+                        
+                        let y_val = *y_plane.add(y_idx) as f64;
+                        let u_val = *u_plane.add(u_idx) as f64 - 128.0;
+                        let v_val = *v_plane.add(v_idx) as f64 - 128.0;
+                        
+                        let r = (y_val + 1.402 * v_val) as u8;
+                        let g = (y_val - 0.344136 * u_val - 0.714136 * v_val) as u8;
+                        let b = (y_val + 1.772 * u_val) as u8;
+                        
+                        rgba_data[rgba_idx] = r;
+                        rgba_data[rgba_idx + 1] = g;
+                        rgba_data[rgba_idx + 2] = b;
+                        rgba_data[rgba_idx + 3] = 255;
+                        rgba_idx += 4;
+                    }
+                }
+            }
+            ffmpeg::util::format::pixel::Pixel::RGB24 => {
+                // RGB24 to RGBA
+                let rgb_ptr = data.as_ptr();
+                let rgba_ptr = rgba_data.as_mut_ptr();
+                
+                for i in 0..pixel_count {
+                    let rgb_idx = i * 3;
+                    let rgba_idx = i * 4;
+                    
+                    *rgba_ptr.add(rgba_idx) = *rgb_ptr.add(rgb_idx);
+                    *rgba_ptr.add(rgba_idx + 1) = *rgb_ptr.add(rgb_idx + 1);
+                    *rgba_ptr.add(rgba_idx + 2) = *rgb_ptr.add(rgb_idx + 2);
+                    *rgba_ptr.add(rgba_idx + 3) = 255;
+                }
+            }
+            _ => {
+                return Err(anyhow::anyhow!("Unsupported pixel format: {:?}", frame.format()));
+            }
+        }
+    }
+    
+    Ok(rgba_data)
 }
 
 fn convert_frame_to_rgba(

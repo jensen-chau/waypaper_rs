@@ -1139,6 +1139,7 @@ dependencies = [
  "anyhow",
  "clap",
  "env_logger",
+ "ffmpeg-next",
  "log",
  "memmap2",
  "ndarray",
