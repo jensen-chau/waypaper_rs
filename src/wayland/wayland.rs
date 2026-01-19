@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::fs::File;
-use std::io::Write;
+use std::io::{Seek, Write};
 use std::os::unix::io::AsFd;
 use wayland_client::protocol::{
     wl_buffer, wl_compositor, wl_display, wl_output, wl_registry, wl_seat, wl_shm, wl_shm_pool,
@@ -21,12 +21,14 @@ pub struct WaylandApp {
     pub surface: Option<wl_surface::WlSurface>,
     pub layer_surface: Option<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1>,
     pub buffer: Option<wl_buffer::WlBuffer>,
+    pub shm_pool: Option<wl_shm_pool::WlShmPool>,
     pub shm_file: Option<File>,
     pub queue: Option<wayland_client::EventQueue<WaylandApp>>,
     pub configured: bool,
     pub configured_width: u32,
     pub configured_height: u32,
     pub frame_count: u64,
+    pub pool_size: i32,
 }
 
 impl WaylandApp {
@@ -34,7 +36,10 @@ impl WaylandApp {
         let conn = Connection::connect_to_env()?;
         let conn_clone = conn.clone();
         let display = conn_clone.display();
-        
+
+        // Calculate pool size for 4K support (3840x2160 * 4 bytes/pixel)
+        let pool_size = 3840 * 2160 * 4;
+
         let mut app = Self {
             conn,
             display: display.clone(),
@@ -44,12 +49,14 @@ impl WaylandApp {
             surface: None,
             layer_surface: None,
             buffer: None,
+            shm_pool: None,
             shm_file: None,
             queue: None,
             configured: false,
             configured_width: 0,
             configured_height: 0,
             frame_count: 0,
+            pool_size,
         };
         
         // Create event queue
@@ -68,10 +75,19 @@ impl WaylandApp {
             queue.roundtrip(&mut app)?;
             iterations += 1;
         }
-        
+
         if app.compositor.is_none() || app.shm.is_none() || app.layer_shell.is_none() {
             return Err(anyhow::anyhow!("Failed to bind Wayland globals"));
         }
+
+        // Create reusable SHM pool
+        let shm = app.shm.as_ref().unwrap();
+        let mut shm_file = tempfile::tempfile()?;
+        shm_file.set_len(app.pool_size as u64)?;
+        let shm_pool = shm.create_pool(shm_file.as_fd(), app.pool_size, &qh, ());
+
+        app.shm_file = Some(shm_file);
+        app.shm_pool = Some(shm_pool);
         
         // Create surface and layer surface
         let compositor = app.compositor.as_ref().unwrap();
@@ -123,34 +139,33 @@ impl WaylandApp {
             .surface
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Surface not available"))?;
-        let shm = self
-            .shm
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("SHM not available"))?;
+        let shm_pool = self.shm_pool.as_ref().ok_or_else(|| anyhow::anyhow!("SHM pool not available"))?;
+        let shm_file = self.shm_file.as_mut().ok_or_else(|| anyhow::anyhow!("SHM file not available"))?;
         let queue = self.queue.as_mut().ok_or_else(|| anyhow::anyhow!("Queue not available"))?;
         let qh = queue.handle();
+
         let stride = width * 4;
         let size = stride * height;
 
-        // Create temporary file for SHM
-        let file_start = std::time::Instant::now();
-        let mut file = tempfile::tempfile()?;
-        file.write_all(frame_data)?;
-        file.set_len(size as u64)?;
-        let file_time = file_start.elapsed();
-        
-        // Debug: log first few pixels (BGRA format) every 30 frames
-        self.frame_count += 1;
-        if self.frame_count % 30 == 0 {
-            log::info!("Frame {} - First 2 pixels (BGRA): B={}, G={}, R={}, A={}, B={}, G={}, R={}, A={}",
-                     self.frame_count, frame_data[0], frame_data[1], frame_data[2], frame_data[3],
-                     frame_data[4], frame_data[5], frame_data[6], frame_data[7]);
+        // Check if pool size is sufficient
+        if size as i32 > self.pool_size {
+            return Err(anyhow::anyhow!("Frame size {} exceeds pool size {}", size, self.pool_size));
         }
 
-        // Create SHM pool and buffer
+        // Write frame data to SHM file
+        let file_start = std::time::Instant::now();
+        shm_file.seek(std::io::SeekFrom::Start(0))?;
+        shm_file.write_all(frame_data)?;
+        let file_time = file_start.elapsed();
+
+        // Destroy old buffer if exists
+        if let Some(old_buffer) = self.buffer.take() {
+            old_buffer.destroy();
+        }
+
+        // Create new buffer from existing pool
         let buffer_start = std::time::Instant::now();
-        let pool = shm.create_pool(file.as_fd(), size as i32, &qh, ());
-        let buffer = pool.create_buffer(
+        let buffer = shm_pool.create_buffer(
             0,
             width as i32,
             height as i32,
@@ -159,7 +174,16 @@ impl WaylandApp {
             &qh,
             (),
         );
+        self.buffer = Some(buffer.clone());
         let buffer_time = buffer_start.elapsed();
+
+        // Debug: log first few pixels (BGRA format) every 30 frames
+        self.frame_count += 1;
+        if self.frame_count % 30 == 0 {
+            log::info!("Frame {} - First 2 pixels (BGRA): B={}, G={}, R={}, A={}, B={}, G={}, R={}, A={}",
+                     self.frame_count, frame_data[0], frame_data[1], frame_data[2], frame_data[3],
+                     frame_data[4], frame_data[5], frame_data[6], frame_data[7]);
+        }
 
         // Attach and commit
         let commit_start = std::time::Instant::now();
@@ -178,6 +202,17 @@ impl WaylandApp {
                      commit_time.as_secs_f64() * 1000.0);
         }
 
+        Ok(())
+    }
+
+    pub fn dispatch_events(&mut self) -> Result<()> {
+        if self.queue.is_some() {
+            // Take the queue temporarily to avoid borrow issues
+            let mut queue = self.queue.take().unwrap();
+            let result = queue.roundtrip(self);
+            self.queue = Some(queue);
+            result.map_err(|e| anyhow::anyhow!("Failed to dispatch events: {}", e))?;
+        }
         Ok(())
     }
 }
@@ -228,6 +263,7 @@ impl Dispatch<wl_shm_pool::WlShmPool, ()> for WaylandApp {
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
+        // wl_shm_pool has no events in the current protocol
     }
 }
 
