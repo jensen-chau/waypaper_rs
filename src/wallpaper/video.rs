@@ -165,7 +165,16 @@ loop {
                 let height = shape[0] as u32;
                 let width = shape[1] as u32;
                 
-                // Convert frame to RGBA
+                // Debug: log pixel format and first few pixels (RGB format)
+                if frame_count % 30 == 0 {
+                    let frame_slice = frame_data.as_slice().unwrap();
+                    info!("Frame {} - {}x{} - First 3 pixels (RGB): R={}, G={}, B={}, R={}, G={}, B={}",
+                          frame_count, width, height,
+                          frame_slice[0], frame_slice[1], frame_slice[2],
+                          frame_slice[3], frame_slice[4], frame_slice[5]);
+                }
+                
+                // Convert frame to BGRA
                 let convert_start = std::time::Instant::now();
                 let rgba_data = convert_frame_to_rgba(&frame_data, width, height)?;
                 let convert_time = convert_start.elapsed();

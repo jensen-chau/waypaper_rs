@@ -26,6 +26,7 @@ pub struct WaylandApp {
     pub configured: bool,
     pub configured_width: u32,
     pub configured_height: u32,
+    pub frame_count: u64,
 }
 
 impl WaylandApp {
@@ -48,6 +49,7 @@ impl WaylandApp {
             configured: false,
             configured_width: 0,
             configured_height: 0,
+            frame_count: 0,
         };
         
         // Create event queue
@@ -136,6 +138,14 @@ impl WaylandApp {
         file.write_all(frame_data)?;
         file.set_len(size as u64)?;
         let file_time = file_start.elapsed();
+        
+        // Debug: log first few pixels (BGRA format) every 30 frames
+        self.frame_count += 1;
+        if self.frame_count % 30 == 0 {
+            log::info!("Frame {} - First 2 pixels (BGRA): B={}, G={}, R={}, A={}, B={}, G={}, R={}, A={}",
+                     self.frame_count, frame_data[0], frame_data[1], frame_data[2], frame_data[3],
+                     frame_data[4], frame_data[5], frame_data[6], frame_data[7]);
+        }
 
         // Create SHM pool and buffer
         let buffer_start = std::time::Instant::now();
