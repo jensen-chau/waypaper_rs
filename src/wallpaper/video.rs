@@ -60,7 +60,7 @@ impl Wallpaper for VideoWallpaper {
     }
 
     fn run(&mut self) {
-        let (tx, rx) = mpsc::channel::<FrameData>(120); // Buffer 120 frames to prevent decode blocking
+        let (tx, rx) = mpsc::channel::<FrameData>(600); // Increased buffer to 600 frames (~24 seconds at 24fps) for smoother looping
         let video_path = self.video_path.clone();
         let is_paused = self.is_paused.clone();
         let is_stopped = self.is_stopped.clone();
@@ -149,39 +149,63 @@ async fn decode_video_async(
 
         // Check if need to restart decoder
         if need_restart {
-            info!("Recreating decoder...");
+            let switch_start = Instant::now();
+            info!("Recreating decoder at {:.2}s...", switch_start.elapsed().as_secs_f64());
 
-            // Create new decoder with hardware acceleration
-            let new_decoder = if available_hw.contains(&HardwareAccelerationDeviceType::VaApi) {
-                DecoderBuilder::new(std::path::Path::new(video_path))
-                    .with_hardware_acceleration(HardwareAccelerationDeviceType::VaApi)
-                    .build()
-            } else if available_hw.contains(&HardwareAccelerationDeviceType::Cuda) {
-                DecoderBuilder::new(std::path::Path::new(video_path))
-                    .with_hardware_acceleration(HardwareAccelerationDeviceType::Cuda)
-                    .build()
-            } else if available_hw.contains(&HardwareAccelerationDeviceType::VideoToolbox) {
-                DecoderBuilder::new(std::path::Path::new(video_path))
-                    .with_hardware_acceleration(HardwareAccelerationDeviceType::VideoToolbox)
-                    .build()
-            } else {
-                Decoder::new(std::path::Path::new(video_path))
+            // Create new decoder synchronously - this is simpler and more reliable
+            let new_decoder = {
+                let video_path_clone = video_path.to_string();
+                let available_hw_clone = available_hw.clone();
+                tokio::task::spawn_blocking(move || {
+                    let decoder_builder = if available_hw_clone.contains(&HardwareAccelerationDeviceType::VaApi) {
+                        DecoderBuilder::new(std::path::Path::new(&video_path_clone))
+                            .with_hardware_acceleration(HardwareAccelerationDeviceType::VaApi)
+                    } else if available_hw_clone.contains(&HardwareAccelerationDeviceType::Cuda) {
+                        DecoderBuilder::new(std::path::Path::new(&video_path_clone))
+                            .with_hardware_acceleration(HardwareAccelerationDeviceType::Cuda)
+                    } else if available_hw_clone.contains(&HardwareAccelerationDeviceType::VideoToolbox) {
+                        DecoderBuilder::new(std::path::Path::new(&video_path_clone))
+                            .with_hardware_acceleration(HardwareAccelerationDeviceType::VideoToolbox)
+                    } else {
+                        DecoderBuilder::new(std::path::Path::new(&video_path_clone))
+                    };
+                    decoder_builder.build()
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to spawn decoder creation task: {}", e))?
+                .map_err(|e| anyhow::anyhow!("Failed to recreate decoder: {}", e))?
             };
 
-            let new_decoder = new_decoder.map_err(|e| anyhow::anyhow!("Failed to recreate decoder: {}", e))?;
+            info!("New decoder created in {:.2}ms", switch_start.elapsed().as_secs_f64() * 1000.0);
 
-            // Replace decoder
-            let mut decoder_guard = decoder_arc.lock().await;
-            *decoder_guard = new_decoder;
-            drop(decoder_guard);
+            // Replace decoder - explicitly drop old decoder first to release resources
+            {
+                let mut decoder_guard = decoder_arc.lock().await;
+                *decoder_guard = new_decoder;
+            }
 
-            // Reset state
+            // Try to seek to the beginning of the video to initialize hardware acceleration
+            // This is a workaround for video-rs not having explicit seek support
+            // We decode and discard the first few frames to warm up the decoder
+            info!("Seeking to beginning by decoding frames...");
+            for _ in 0..2 {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    async {
+                        let mut decoder_guard = decoder_arc.lock().await;
+                        decoder_guard.decode()
+                    }
+                ).await;
+            }
+
+            // Reset state - but keep last_pts to maintain timing continuity
             frame_count = 0;
-            last_pts = None;
+            // Don't reset last_pts to avoid timing issues on loop
+            // last_pts = None;
             frame_time_ms = 33;
             need_restart = false;
 
-            info!("Decoder reinitialized, continuing decode");
+            info!("Decoder reinitialized and seeked to beginning in {:.2}ms, continuing decode", switch_start.elapsed().as_secs_f64() * 1000.0);
             continue;
         }
 
@@ -348,7 +372,7 @@ async fn decode_video_hwaccel(
     let mut total_decode_time = Duration::from_secs(0);
     let mut total_convert_time = Duration::from_secs(0);
     
-    let packet = ffmpeg::packet::Packet::empty();
+    let _packet = ffmpeg::packet::Packet::empty();
     let mut frame = ffmpeg::frame::Video::empty();
     
     // Get time_base before loop to avoid borrow issues
@@ -569,6 +593,7 @@ async fn render_frames_async(
     let start_time = std::time::Instant::now();
     let mut first_frame_time: Option<std::time::Instant> = None;
     let mut next_frame_time = start_time; // Time when next frame should be displayed
+    let mut last_frame_time: Option<std::time::Instant> = None;
 
     while !*is_stopped.lock().await {
         // Check pause flag
@@ -578,10 +603,29 @@ async fn render_frames_async(
         }
 
         // Try to receive a frame - use timeout for non-blocking
+        let recv_start = std::time::Instant::now();
         match tokio::time::timeout(Duration::from_millis(1), rx.recv()).await {
             Ok(Some(frame_data)) => {
+                let recv_duration = recv_start.elapsed();
                 frame_count += 1;
-                
+
+                // Log frame receive time gap
+                if let Some(last) = last_frame_time {
+                    let gap = last.elapsed();
+                    if gap.as_millis() > 50 {
+                        warn!("Frame receive gap: {:.2}ms (frame {})", gap.as_secs_f64() * 1000.0, frame_count);
+                    }
+                }
+                last_frame_time = Some(std::time::Instant::now());
+
+                // Check if this is a loop restart (frame_time reset to default 33ms)
+                if frame_data.frame_time == 33 && frame_count > 100 {
+                    // This might be a loop restart, reset timing
+                    info!("Possible loop restart detected at frame {}, resetting timing", frame_count);
+                    first_frame_time = Some(std::time::Instant::now());
+                    next_frame_time = std::time::Instant::now();
+                }
+
                 // For the first frame, initialize timing
                 let now = std::time::Instant::now();
                 if first_frame_time.is_none() {
@@ -589,7 +633,7 @@ async fn render_frames_async(
                     next_frame_time = now;
                     info!("First frame received, starting playback");
                 }
-                
+
                 let render_start = std::time::Instant::now();
 
                 // Render frame to Wayland surface
@@ -642,6 +686,7 @@ async fn render_frames_async(
             }
             Err(_) => {
                 // Timeout, no frame available, continue
+                // This is normal when waiting for next frame
                 continue;
             }
         }
