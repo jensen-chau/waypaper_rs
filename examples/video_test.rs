@@ -1,9 +1,10 @@
 use waypaper_rs::wallpaper::video::VideoWallpaper;
 use waypaper_rs::wallpaper::Wallpaper;
 use std::time::Duration;
-use std::thread;
+use tokio::time::sleep;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     
     let video_path = std::env::args()
@@ -22,7 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Let it run for longer to see if frames are decoded
     println!("Running for 30 seconds...");
-    thread::sleep(Duration::from_secs(30));
+    sleep(Duration::from_secs(30)).await;
     
     // Stop the wallpaper
     wallpaper.stop();
