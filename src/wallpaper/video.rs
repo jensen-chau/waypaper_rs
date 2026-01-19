@@ -244,8 +244,10 @@ fn render_frames(
         }
     };
     
-    let mut last_frame_time: Option<u32> = None;
     let mut frame_count = 0u64;
+    let mut last_frame_time = std::time::Instant::now();
+    let target_fps = 60.0; // Target 60 FPS
+    let frame_duration = Duration::from_secs_f64(1.0 / target_fps);
     
     while !is_stopped.load(std::sync::atomic::Ordering::SeqCst) {
         if is_paused.load(std::sync::atomic::Ordering::SeqCst) {
@@ -253,28 +255,41 @@ fn render_frames(
             continue;
         }
         
-        match rx.recv_timeout(Duration::from_millis(100)) {
+        match rx.recv_timeout(Duration::from_millis(10)) {
             Ok(frame_data) => {
                 frame_count += 1;
-                
-                // Calculate timing based on frame_time
-                if let Some(last_time) = last_frame_time {
-                    let time_diff = frame_data.frame_time.saturating_sub(last_time);
-                    if time_diff > 0 && time_diff < 1000 {
-                        thread::sleep(Duration::from_millis(time_diff as u64));
-                    }
-                }
+                let render_start = std::time::Instant::now();
                 
                 // Render frame to Wayland surface
                 if let Err(e) = wayland_app.render_frame(&frame_data.frame, frame_data.width, frame_data.height) {
                     error!("Failed to render frame: {}", e);
                 }
                 
+                let render_time = render_start.elapsed();
+                let elapsed_since_last_frame = last_frame_time.elapsed();
+                
+                // Calculate actual FPS
+                let fps = if elapsed_since_last_frame.as_secs_f64() > 0.0 {
+                    1.0 / elapsed_since_last_frame.as_secs_f64()
+                } else {
+                    target_fps
+                };
+                
+                // Log every 30 frames
                 if frame_count % 30 == 0 {
-                    info!("Rendered {} frames", frame_count);
+                    info!("Frame {}: {}x{}, frame_time={}ms, render_time={:.2}ms, elapsed={:.2}ms, FPS={:.2}",
+                          frame_count, frame_data.width, frame_data.height, 
+                          frame_data.frame_time, render_time.as_secs_f64() * 1000.0,
+                          elapsed_since_last_frame.as_secs_f64() * 1000.0, fps);
                 }
                 
-                last_frame_time = Some(frame_data.frame_time);
+                // Control frame rate - sleep if we rendered too fast
+                if render_time < frame_duration {
+                    let sleep_time = frame_duration.saturating_sub(render_time);
+                    thread::sleep(sleep_time);
+                }
+                
+                last_frame_time = std::time::Instant::now();
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // No frame available, continue waiting
@@ -287,5 +302,5 @@ fn render_frames(
         }
     }
     
-    info!("Render thread stopped");
+    info!("Render thread stopped, total frames rendered: {}", frame_count);
 }
