@@ -218,23 +218,24 @@ fn convert_frame_to_rgba(
     // frame_data is expected to be in RGB format (height, width, 3)
     // We need to convert it to RGBA (height, width, 4)
     
-    let mut rgba_data = vec![0u8; (width * height * 4) as usize];
+    let pixel_count = (width * height) as usize;
+    let mut rgba_data = vec![0u8; pixel_count * 4];
     
-    let frame_data_view = frame_data.view();
+    let frame_data_slice = frame_data.as_slice().unwrap();
     
-    // Convert RGB to RGBA
-    for y in 0..height {
-        for x in 0..width {
-            let dst_idx = (y * width + x) as usize * 4;
+    // Use unsafe pointer arithmetic for maximum performance
+    unsafe {
+        let rgb_ptr = frame_data_slice.as_ptr();
+        let rgba_ptr = rgba_data.as_mut_ptr();
+        
+        for i in 0..pixel_count {
+            let rgb_idx = i * 3;
+            let rgba_idx = i * 4;
             
-            // Ensure we're within bounds
-            if dst_idx + 3 < rgba_data.len() {
-                // Copy RGB values
-                rgba_data[dst_idx] = frame_data_view[[y as usize, x as usize, 0]]; // R
-                rgba_data[dst_idx + 1] = frame_data_view[[y as usize, x as usize, 1]]; // G
-                rgba_data[dst_idx + 2] = frame_data_view[[y as usize, x as usize, 2]]; // B
-                rgba_data[dst_idx + 3] = 255; // A (fully opaque)
-            }
+            *rgba_ptr.add(rgba_idx) = *rgb_ptr.add(rgb_idx);         // R
+            *rgba_ptr.add(rgba_idx + 1) = *rgb_ptr.add(rgb_idx + 1); // G
+            *rgba_ptr.add(rgba_idx + 2) = *rgb_ptr.add(rgb_idx + 2); // B
+            *rgba_ptr.add(rgba_idx + 3) = 255;                        // A
         }
     }
     
