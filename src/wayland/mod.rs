@@ -1,1 +1,3 @@
-pub mod wayland_protocol;
+pub mod wayland;
+
+pub use wayland::WaylandApp;

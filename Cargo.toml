@@ -22,3 +22,5 @@ wayland-protocols-wlr = { version = "0.3.5", features = ["client"] }
 wayland-scanner = "0.31.0"
 memmap2 = "0.9"
 tempfile = "3"
+video-rs = { version = "0.8", features = ["ndarray"] }
+ndarray = "=0.15.6"
