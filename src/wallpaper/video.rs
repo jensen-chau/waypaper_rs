@@ -482,30 +482,32 @@ fn convert_frame_to_rgba(
     height: u32,
 ) -> Result<Vec<u8>> {
     // frame_data is expected to be in RGB format (height, width, 3)
-    // We need to convert it to RGBA (height, width, 4)
+    // Wayland uses BGRA format, so we need to convert RGB -> BGRA
+    // Note: Wayland expects BGRA, not RGBA
     
     let pixel_count = (width * height) as usize;
-    let mut rgba_data = vec![0u8; pixel_count * 4];
+    let mut bgra_data = vec![0u8; pixel_count * 4];
     
     let frame_data_slice = frame_data.as_slice().unwrap();
     
     // Use unsafe pointer arithmetic for maximum performance
+    // RGB24 -> BGRA: R->B, G->G, B->R
     unsafe {
         let rgb_ptr = frame_data_slice.as_ptr();
-        let rgba_ptr = rgba_data.as_mut_ptr();
+        let bgra_ptr = bgra_data.as_mut_ptr();
         
         for i in 0..pixel_count {
             let rgb_idx = i * 3;
-            let rgba_idx = i * 4;
+            let bgra_idx = i * 4;
             
-            *rgba_ptr.add(rgba_idx) = *rgb_ptr.add(rgb_idx);         // R
-            *rgba_ptr.add(rgba_idx + 1) = *rgb_ptr.add(rgb_idx + 1); // G
-            *rgba_ptr.add(rgba_idx + 2) = *rgb_ptr.add(rgb_idx + 2); // B
-            *rgba_ptr.add(rgba_idx + 3) = 255;                        // A
+            *bgra_ptr.add(bgra_idx) = *rgb_ptr.add(rgb_idx + 2);     // B <- R
+            *bgra_ptr.add(bgra_idx + 1) = *rgb_ptr.add(rgb_idx + 1); // G <- G
+            *bgra_ptr.add(bgra_idx + 2) = *rgb_ptr.add(rgb_idx);     // R <- B
+            *bgra_ptr.add(bgra_idx + 3) = 255;                        // A (fully opaque)
         }
     }
     
-    Ok(rgba_data)
+    Ok(bgra_data)
 }
 
 async fn render_frames_async(
@@ -525,7 +527,7 @@ async fn render_frames_async(
     };
     
     let mut frame_count = 0u64;
-    let mut last_frame_time = std::time::Instant::now();
+    let start_time = std::time::Instant::now();
     let target_fps = 60.0; // Target 60 FPS
     let frame_duration = Duration::from_secs_f64(1.0 / target_fps);
     let mut total_render_time = Duration::from_secs(0);
@@ -549,22 +551,22 @@ async fn render_frames_async(
                 
                 let render_time = render_start.elapsed();
                 total_render_time += render_time;
-                let elapsed_since_last_frame = last_frame_time.elapsed();
+                let total_elapsed = start_time.elapsed();
                 
-                // Calculate actual FPS
-                let fps = if elapsed_since_last_frame.as_secs_f64() > 0.0 {
-                    1.0 / elapsed_since_last_frame.as_secs_f64()
+                // Calculate actual FPS based on total time
+                let fps = if total_elapsed.as_secs_f64() > 0.0 {
+                    frame_count as f64 / total_elapsed.as_secs_f64()
                 } else {
-                    target_fps
+                    0.0
                 };
                 
                 // Log every 30 frames
                 if frame_count % 30 == 0 {
                     let avg_render = total_render_time.as_secs_f64() * 1000.0 / 30.0;
-                    info!("Render {}: {}x{}, frame_time={}ms, avg_render={:.2}ms, elapsed={:.2}ms, FPS={:.2}",
+                    info!("Render {}: {}x{}, frame_time={}ms, avg_render={:.2}ms, total_elapsed={:.2}s, FPS={:.2}",
                           frame_count, frame_data.width, frame_data.height, 
                           frame_data.frame_time, avg_render,
-                          elapsed_since_last_frame.as_secs_f64() * 1000.0, fps);
+                          total_elapsed.as_secs_f64(), fps);
                     total_render_time = Duration::from_secs(0);
                 }
                 
@@ -573,8 +575,6 @@ async fn render_frames_async(
                     let sleep_time = frame_duration.saturating_sub(render_time);
                     tokio::time::sleep(sleep_time).await;
                 }
-                
-                last_frame_time = std::time::Instant::now();
             }
             Ok(None) => {
                 // Channel closed
