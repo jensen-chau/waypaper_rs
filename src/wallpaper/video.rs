@@ -120,6 +120,8 @@ fn decode_video(
     let mut frame_count = 0u64;
     let mut last_pts: Option<f64> = None;
     let mut frame_time_ms: u32 = 33; // Default to ~30fps
+    let mut total_decode_time = Duration::from_secs(0);
+    let mut total_convert_time = Duration::from_secs(0);
     
     loop {
         if is_stopped.load(std::sync::atomic::Ordering::SeqCst) {
@@ -133,8 +135,11 @@ fn decode_video(
         }
         
         // Decode next frame
+        let decode_start = std::time::Instant::now();
         match decoder.decode() {
             Ok((timestamp, frame_data)) => {
+                let decode_time = decode_start.elapsed();
+                total_decode_time += decode_time;
                 frame_count += 1;
                 
                 // Get frame dimensions from the frame data itself
@@ -143,7 +148,10 @@ fn decode_video(
                 let width = shape[1] as u32;
                 
                 // Convert frame to RGBA
+                let convert_start = std::time::Instant::now();
                 let rgba_data = convert_frame_to_rgba(&frame_data, width, height)?;
+                let convert_time = convert_start.elapsed();
+                total_convert_time += convert_time;
                 
                 // Calculate frame time based on timestamp
                 // timestamp is a Time type
@@ -174,7 +182,12 @@ fn decode_video(
                 }
                 
                 if frame_count % 30 == 0 {
-                    info!("Decoded {} frames, frame time: {}ms", frame_count, frame_time_ms);
+                    let avg_decode = total_decode_time.as_secs_f64() * 1000.0 / 30.0;
+                    let avg_convert = total_convert_time.as_secs_f64() * 1000.0 / 30.0;
+                    info!("Decoded {} frames, frame time: {}ms, avg_decode={:.2}ms, avg_convert={:.2}ms", 
+                          frame_count, frame_time_ms, avg_decode, avg_convert);
+                    total_decode_time = Duration::from_secs(0);
+                    total_convert_time = Duration::from_secs(0);
                 }
             }
             Err(e) => {
@@ -248,6 +261,7 @@ fn render_frames(
     let mut last_frame_time = std::time::Instant::now();
     let target_fps = 60.0; // Target 60 FPS
     let frame_duration = Duration::from_secs_f64(1.0 / target_fps);
+    let mut total_render_time = Duration::from_secs(0);
     
     while !is_stopped.load(std::sync::atomic::Ordering::SeqCst) {
         if is_paused.load(std::sync::atomic::Ordering::SeqCst) {
@@ -266,6 +280,7 @@ fn render_frames(
                 }
                 
                 let render_time = render_start.elapsed();
+                total_render_time += render_time;
                 let elapsed_since_last_frame = last_frame_time.elapsed();
                 
                 // Calculate actual FPS
@@ -277,10 +292,12 @@ fn render_frames(
                 
                 // Log every 30 frames
                 if frame_count % 30 == 0 {
-                    info!("Frame {}: {}x{}, frame_time={}ms, render_time={:.2}ms, elapsed={:.2}ms, FPS={:.2}",
+                    let avg_render = total_render_time.as_secs_f64() * 1000.0 / 30.0;
+                    info!("Render {}: {}x{}, frame_time={}ms, avg_render={:.2}ms, elapsed={:.2}ms, FPS={:.2}",
                           frame_count, frame_data.width, frame_data.height, 
-                          frame_data.frame_time, render_time.as_secs_f64() * 1000.0,
+                          frame_data.frame_time, avg_render,
                           elapsed_since_last_frame.as_secs_f64() * 1000.0, fps);
+                    total_render_time = Duration::from_secs(0);
                 }
                 
                 // Control frame rate - sleep if we rendered too fast

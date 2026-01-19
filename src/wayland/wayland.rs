@@ -131,11 +131,14 @@ impl WaylandApp {
         let size = stride * height;
 
         // Create temporary file for SHM
+        let file_start = std::time::Instant::now();
         let mut file = tempfile::tempfile()?;
         file.write_all(frame_data)?;
         file.set_len(size as u64)?;
+        let file_time = file_start.elapsed();
 
         // Create SHM pool and buffer
+        let buffer_start = std::time::Instant::now();
         let pool = shm.create_pool(file.as_fd(), size as i32, &qh, ());
         let buffer = pool.create_buffer(
             0,
@@ -146,11 +149,24 @@ impl WaylandApp {
             &qh,
             (),
         );
+        let buffer_time = buffer_start.elapsed();
 
         // Attach and commit
+        let commit_start = std::time::Instant::now();
         surface.attach(Some(&buffer), 0, 0);
         surface.damage(0, 0, width as i32, height as i32);
         surface.commit();
+        let commit_time = commit_start.elapsed();
+
+        // Log timing every 30 frames
+        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if count % 30 == 0 {
+            log::info!("Render timing: file_write={:.2}ms, buffer_create={:.2}ms, commit={:.2}ms",
+                     file_time.as_secs_f64() * 1000.0,
+                     buffer_time.as_secs_f64() * 1000.0,
+                     commit_time.as_secs_f64() * 1000.0);
+        }
 
         Ok(())
     }
