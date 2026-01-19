@@ -24,4 +24,4 @@ memmap2 = "0.9"
 tempfile = "3"
 video-rs = { version = "0.10", features = ["ndarray"] }
 ndarray = "0.16"
-ffmpeg-next = "7"
+ffmpeg-next = { version = "7", features = ["codec", "filter", "software-scaling"] }

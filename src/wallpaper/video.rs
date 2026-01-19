@@ -65,7 +65,7 @@ impl Wallpaper for VideoWallpaper {
     }
 
     fn run(&mut self) {
-        let (tx, rx) = mpsc::channel::<FrameData>();
+        let (tx, rx) = mpsc::channel::<FrameData>(30); // Buffer 30 frames
         let video_path = self.video_path.clone();
         let is_paused = self.is_paused.clone();
         let is_stopped = self.is_stopped.clone();
