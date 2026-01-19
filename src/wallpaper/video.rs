@@ -211,9 +211,6 @@ fn decode_video(
                         warn!("Render thread disconnected");
                         break;
                     }
-                } {
-                    warn!("Render thread disconnected");
-                    break;
                 }
                 
                 if frame_count % 30 == 0 {
@@ -401,9 +398,6 @@ fn decode_video_hwaccel(
                         warn!("Render thread disconnected");
                         break;
                     }
-                } {
-                    warn!("Render thread disconnected");
-                    break;
                 }
                 
                 if frame_count % 30 == 0 {
