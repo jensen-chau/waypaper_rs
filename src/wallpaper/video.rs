@@ -1,7 +1,7 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, mpsc};
-use std::thread::{self};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 use log::{info, error, warn};
 
 use crate::wallpaper::{project, WallpaperType};
@@ -65,7 +65,7 @@ impl Wallpaper for VideoWallpaper {
     }
 
     fn run(&mut self) {
-        let (tx, rx) = mpsc::channel::<FrameData>(30); // Buffer 30 frames
+        let (tx, rx) = mpsc::sync_channel::<FrameData>(30); // Buffer 30 frames
         let video_path = self.video_path.clone();
         let is_paused = self.is_paused.clone();
         let is_stopped = self.is_stopped.clone();
@@ -98,7 +98,7 @@ impl Wallpaper for VideoWallpaper {
 
 fn decode_video(
     video_path: &str,
-    tx: mpsc::Sender<FrameData>,
+    tx: mpsc::SyncSender<FrameData>,
     is_paused: &Arc<AtomicBool>,
     is_stopped: &Arc<AtomicBool>,
 ) -> Result<()> {
@@ -159,8 +159,8 @@ fn decode_video(
             continue;
         }
         
-        // Decode next frame
-        let decode_start = std::time::Instant::now();
+        // Decode next frame - decode as fast as possible, no sleep
+        let decode_start = Instant::now();
         match decoder.decode() {
             Ok((timestamp, frame_data)) => {
                 let decode_time = decode_start.elapsed();
@@ -201,7 +201,17 @@ fn decode_video(
                     frame_time: frame_time_ms,
                 };
                 
-                if tx.send(frame_data).is_err() {
+                match tx.try_send(frame_data) {
+                    Ok(_) => {}
+                    Err(mpsc::TrySendError::Full(_)) => {
+                        // Buffer is full, skip this frame
+                        continue;
+                    }
+                    Err(mpsc::TrySendError::Disconnected(_)) => {
+                        warn!("Render thread disconnected");
+                        break;
+                    }
+                } {
                     warn!("Render thread disconnected");
                     break;
                 }
@@ -255,9 +265,10 @@ fn decode_video(
 
 // Hardware-accelerated decode using ffmpeg-next
 #[allow(dead_code)]
+#[allow(dead_code)]
 fn decode_video_hwaccel(
     video_path: &str,
-    tx: mpsc::Sender<FrameData>,
+    tx: mpsc::SyncSender<FrameData>,
     is_paused: &Arc<AtomicBool>,
     is_stopped: &Arc<AtomicBool>,
 ) -> Result<()> {
@@ -380,7 +391,17 @@ fn decode_video_hwaccel(
                     frame_time: frame_time_ms,
                 };
                 
-                if tx.send(frame_data).is_err() {
+                match tx.try_send(frame_data) {
+                    Ok(_) => {}
+                    Err(mpsc::TrySendError::Full(_)) => {
+                        // Buffer is full, skip this frame
+                        continue;
+                    }
+                    Err(mpsc::TrySendError::Disconnected(_)) => {
+                        warn!("Render thread disconnected");
+                        break;
+                    }
+                } {
                     warn!("Render thread disconnected");
                     break;
                 }
@@ -536,7 +557,8 @@ fn render_frames(
             continue;
         }
         
-        match rx.recv_timeout(Duration::from_millis(10)) {
+        // Try to receive a frame - non-blocking
+        match rx.try_recv() {
             Ok(frame_data) => {
                 frame_count += 1;
                 let render_start = std::time::Instant::now();
@@ -575,11 +597,12 @@ fn render_frames(
                 
                 last_frame_time = std::time::Instant::now();
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // No frame available, continue waiting
+            Err(mpsc::TryRecvError::Empty) => {
+                // No frame available, sleep a bit and try again
+                thread::sleep(Duration::from_millis(1));
                 continue;
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(mpsc::TryRecvError::Disconnected) => {
                 info!("Decode thread disconnected");
                 break;
             }
