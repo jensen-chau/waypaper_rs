@@ -102,21 +102,37 @@ fn decode_video(
     is_paused: &Arc<AtomicBool>,
     is_stopped: &Arc<AtomicBool>,
 ) -> Result<()> {
-    use video_rs::Decoder;
+    use video_rs::{Decoder, DecoderBuilder};
+    use video_rs::hwaccel::HardwareAccelerationDeviceType;
     
     info!("Opening video: {}", video_path);
     
-    // Try to open video decoder with hardware acceleration
-    let mut decoder = match Decoder::new(std::path::Path::new(video_path)) {
-        Ok(dec) => {
-            info!("Opened video with software decoder");
-            dec
-        }
-        Err(e) => {
-            error!("Failed to open video: {}", e);
-            return Err(e.into());
-        }
+    // Check available hardware acceleration
+    let available_hw = HardwareAccelerationDeviceType::list_available();
+    info!("Available hardware acceleration devices: {:?}", available_hw);
+    
+    // Try to create decoder with hardware acceleration
+    let decoder = if available_hw.contains(&HardwareAccelerationDeviceType::VaApi) {
+        info!("Using VA-API hardware acceleration (Intel/AMD GPU)");
+        DecoderBuilder::new(std::path::Path::new(video_path))
+            .with_hardware_acceleration(HardwareAccelerationDeviceType::VaApi)
+            .build()
+    } else if available_hw.contains(&HardwareAccelerationDeviceType::Cuda) {
+        info!("Using CUDA hardware acceleration (NVIDIA GPU)");
+        DecoderBuilder::new(std::path::Path::new(video_path))
+            .with_hardware_acceleration(HardwareAccelerationDeviceType::Cuda)
+            .build()
+    } else if available_hw.contains(&HardwareAccelerationDeviceType::VideoToolbox) {
+        info!("Using VideoToolbox hardware acceleration (Apple)");
+        DecoderBuilder::new(std::path::Path::new(video_path))
+            .with_hardware_acceleration(HardwareAccelerationDeviceType::VideoToolbox)
+            .build()
+    } else {
+        info!("No hardware acceleration available, using software decoding");
+        Decoder::new(std::path::Path::new(video_path))
     };
+    
+    let mut decoder = decoder.map_err(|e| anyhow::anyhow!("Failed to create decoder: {}", e))?;
     
     // Get time base for timestamp calculations
     let time_base = decoder.time_base();
@@ -201,10 +217,28 @@ fn decode_video(
             }
             Err(e) => {
                 let error_msg = e.to_string().to_lowercase();
-                if error_msg.contains("end") || error_msg.contains("eof") {
+                if error_msg.contains("end") || error_msg.contains("eof") || error_msg.contains("exhausted") {
                     // End of video, loop back
                     info!("Video ended, restarting");
-                    decoder = Decoder::new(std::path::Path::new(video_path))?;
+                    
+                    // Recreate decoder with hardware acceleration
+                    let new_decoder = if available_hw.contains(&HardwareAccelerationDeviceType::VaApi) {
+                        DecoderBuilder::new(std::path::Path::new(video_path))
+                            .with_hardware_acceleration(HardwareAccelerationDeviceType::VaApi)
+                            .build()
+                    } else if available_hw.contains(&HardwareAccelerationDeviceType::Cuda) {
+                        DecoderBuilder::new(std::path::Path::new(video_path))
+                            .with_hardware_acceleration(HardwareAccelerationDeviceType::Cuda)
+                            .build()
+                    } else if available_hw.contains(&HardwareAccelerationDeviceType::VideoToolbox) {
+                        DecoderBuilder::new(std::path::Path::new(video_path))
+                            .with_hardware_acceleration(HardwareAccelerationDeviceType::VideoToolbox)
+                            .build()
+                    } else {
+                        Decoder::new(std::path::Path::new(video_path))
+                    };
+                    
+                    decoder = new_decoder.map_err(|e| anyhow::anyhow!("Failed to recreate decoder: {}", e))?;
                     frame_count = 0;
                     last_pts = None;
                     frame_time_ms = 33;
