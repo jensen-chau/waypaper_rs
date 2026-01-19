@@ -1,0 +1,278 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="wayland">
+    <interface name="wl_compositor" version="4">
+        <request name="create_surface">
+            <arg name="id" type="new_id" interface="wl_surface" version="4"/>
+        </request>
+    </interface>
+
+    <interface name="wl_surface" version="4">
+        <request name="attach">
+            <arg name="buffer" type="object" interface="wl_buffer" allow-null="true"/>
+            <arg name="x" type="int"/>
+            <arg name="y" type="int"/>
+        </request>
+        <request name="damage">
+            <arg name="x" type="int"/>
+            <arg name="y" type="int"/>
+            <arg name="width" type="int"/>
+            <arg name="height" type="int"/>
+        </request>
+        <request name="commit"/>
+    </interface>
+
+    <interface name="wl_shm" version="1">
+        <request name="create_pool">
+            <arg name="fd" type="fd"/>
+            <arg name="size" type="int"/>
+        </request>
+    </interface>
+
+    <interface name="wl_shm_pool" version="1">
+        <request name="create_buffer">
+            <arg name="offset" type="int"/>
+            <arg name="width" type="int"/>
+            <arg name="height" type="int"/>
+            <arg name="stride" type="int"/>
+            <arg name="format" type="uint"/>
+        </request>
+    </interface>
+
+    <interface name="wl_buffer" version="1">
+        <event name="release"/>
+    </interface>
+
+    <interface name="wl_output" version="4">
+        <event name="geometry">
+            <arg name="x" type="int"/>
+            <arg name="y" type="int"/>
+            <arg name="physical_width" type="int"/>
+            <arg name="physical_height" type="int"/>
+            <arg name="subpixel" type="int"/>
+            <arg name="make" type="string"/>
+            <arg name="model" type="string"/>
+            <arg name="transform" type="int"/>
+        </event>
+        <event name="mode">
+            <arg name="flags" type="uint"/>
+            <arg name="width" type="int"/>
+            <arg name="height" type="int"/>
+            <arg name="refresh" type="int"/>
+        </event>
+        <event name="done"/>
+        <event name="scale">
+            <arg name="factor" type="int"/>
+        </event>
+    </interface>
+
+    <interface name="wl_seat" version="9">
+        <event name="capabilities">
+            <arg name="capabilities" type="uint"/>
+        </event>
+    </interface>
+
+    <interface name="wl_keyboard" version="9">
+        <event name="keymap">
+            <arg name="format" type="uint"/>
+            <arg name="fd" type="fd"/>
+            <arg name="size" type="uint"/>
+        </event>
+        <event name="enter">
+            <arg name="serial" type="uint"/>
+            <arg name="surface" type="object" interface="wl_surface"/>
+        </event>
+        <event name="leave">
+            <arg name="serial" type="uint"/>
+            <arg name="surface" type="object" interface="wl_surface"/>
+        </event>
+        <event name="key">
+            <arg name="serial" type="uint"/>
+            <arg name="time" type="uint"/>
+            <arg name="key" type="uint"/>
+            <arg name="state" type="uint"/>
+        </event>
+        <event name="modifiers">
+            <arg name="serial" type="uint"/>
+            <arg name="mods_depressed" type="uint"/>
+            <arg name="mods_latched" type="uint"/>
+            <arg name="mods_locked" type="uint"/>
+            <arg name="group" type="uint"/>
+        </event>
+        <event name="repeat_info">
+            <arg name="rate" type="int"/>
+            <arg name="delay" type="int"/>
+        </event>
+    </interface>
+
+    <interface name="wl_pointer" version="9">
+        <event name="enter">
+            <arg name="serial" type="uint"/>
+            <arg name="surface" type="object" interface="wl_surface"/>
+        </event>
+        <event name="leave">
+            <arg name="serial" type="uint"/>
+            <arg name="surface" type="object" interface="wl_surface"/>
+        </event>
+        <event name="motion">
+            <arg name="time" type="uint"/>
+            <arg name="x" type="fixed"/>
+            <arg name="y" type="fixed"/>
+        </event>
+        <event name="button">
+            <arg name="serial" type="uint"/>
+            <arg name="time" type="uint"/>
+            <arg name="button" type="uint"/>
+            <arg name="state" type="uint"/>
+        </event>
+        <event name="axis">
+            <arg name="time" type="uint"/>
+            <arg name="axis" type="uint"/>
+            <arg name="value" type="fixed"/>
+        </event>
+        <event name="frame"/>
+        <event name="axis_source">
+            <arg name="axis_source" type="uint"/>
+        </event>
+        <event name="axis_stop">
+            <arg name="time" type="uint"/>
+            <arg name="axis" type="uint"/>
+        </event>
+        <event name="axis_discrete">
+            <arg name="axis" type="uint"/>
+            <arg name="discrete" type="int"/>
+        </event>
+        <event name="axis_value120">
+            <arg name="axis" type="uint"/>
+            <arg name="value120" type="int"/>
+        </event>
+    </interface>
+
+    <interface name="wl_touch" version="9">
+        <event name="down">
+            <arg name="serial" type="uint"/>
+            <arg name="time" type="uint"/>
+            <arg name="surface" type="object" interface="wl_surface"/>
+            <arg name="id" type="int"/>
+            <arg name="x" type="fixed"/>
+            <arg name="y" type="fixed"/>
+        </event>
+        <event name="up">
+            <arg name="serial" type="uint"/>
+            <arg name="time" type="uint"/>
+            <arg name="id" type="int"/>
+        </event>
+        <event name="motion">
+            <arg name="time" type="uint"/>
+            <arg name="id" type="int"/>
+            <arg name="x" type="fixed"/>
+            <arg name="y" type="fixed"/>
+        </event>
+        <event name="orientation">
+            <arg name="time" type="uint"/>
+            <arg name="id" type="int"/>
+            <arg name="orientation" type="fixed"/>
+        </event>
+        <event name="frame"/>
+        <event name="cancel">
+            <arg name="serial" type="uint"/>
+            <arg name="time" type="uint"/>
+        </event>
+    </interface>
+
+    <interface name="wl_data_device" version="3">
+        <event name="data_offer">
+            <arg name="id" type="new_id" interface="wl_data_offer"/>
+        </event>
+        <event name="enter">
+            <arg name="serial" type="uint"/>
+            <arg name="surface" type="object" interface="wl_surface"/>
+            <arg name="x" type="fixed"/>
+            <arg name="y" type="fixed"/>
+            <arg name="id" type="object" interface="wl_data_offer"/>
+        </event>
+        <event name="leave"/>
+        <event name="selection">
+            <arg name="id" type="object" interface="wl_data_offer"/>
+        </event>
+    </interface>
+
+    <interface name="wl_data_offer" version="3">
+        <request name="accept">
+            <arg name="serial" type="uint"/>
+            <arg name="mime_type" type="string" allow-null="true"/>
+        </request>
+        <request name="receive">
+            <arg name="mime_type" type="string"/>
+            <arg name="fd" type="fd"/>
+        </request>
+        <request name="destroy" type="destructor"/>
+        <event name="offer">
+            <arg name="mime_type" type="string"/>
+        </event>
+        <event name="source_actions">
+            <arg name="source_actions" type="uint"/>
+        </event>
+        <event name="action">
+            <arg name="dnd_action" type="uint"/>
+        </event>
+    </interface>
+
+    <interface name="wl_data_device_manager" version="3">
+        <request name="create_data_source">
+            <arg name="id" type="new_id" interface="wl_data_source"/>
+        </request>
+        <request name="get_data_device">
+            <arg name="seat" type="object" interface="wl_seat"/>
+            <arg name="id" type="new_id" interface="wl_data_device"/>
+        </request>
+        <enum name="dnd_action">
+            <entry name="none" value="0"/>
+            <entry name="copy" value="1"/>
+            <entry name="move" value="2"/>
+            <entry name="ask" value="3"/>
+        </enum>
+    </interface>
+
+    <interface name="wl_data_source" version="3">
+        <request name="offer">
+            <arg name="mime_type" type="string"/>
+        </request>
+        <request name="destroy" type="destructor"/>
+        <event name="target">
+            <arg name="mime_type" type="string" allow-null="true"/>
+        </event>
+        <event name="send">
+            <arg name="mime_type" type="string"/>
+            <arg name="fd" type="fd"/>
+        </event>
+        <event name="cancelled"/>
+        <event name="dnd_drop_performed"/>
+        <event name="dnd_finished"/>
+        <event name="action">
+            <arg name="dnd_action" type="uint"/>
+        </event>
+    </interface>
+
+    <interface name="wl_registry" version="1">
+        <request name="bind">
+            <arg name="name" type="uint"/>
+            <arg name="id" type="string"/>
+            <arg name="version" type="uint"/>
+            <arg name="new_id" type="new_id"/>
+        </request>
+        <event name="global">
+            <arg name="name" type="uint"/>
+            <arg name="interface" type="string"/>
+            <arg name="version" type="uint"/>
+        </event>
+        <event name="global_remove">
+            <arg name="name" type="uint"/>
+        </event>
+    </interface>
+
+    <interface name="wl_callback" version="1">
+        <event name="done">
+            <arg name="callback_data" type="uint"/>
+        </event>
+    </interface>
+</protocol>
