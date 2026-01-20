@@ -138,7 +138,6 @@ async fn decode_video_async(
     let mut frame_time_ms: u32 = 33; // Default to ~30fps
     let mut total_decode_time = Duration::from_secs(0);
     let mut total_convert_time = Duration::from_secs(0);
-    let mut need_restart = false;
 
     loop {
         // Check stop flag every frame (critical for shutdown)
@@ -147,67 +146,7 @@ async fn decode_video_async(
             break;
         }
 
-        // Check if need to restart decoder
-        if need_restart {
-            let switch_start = Instant::now();
-            info!("Recreating decoder at {:.2}s...", switch_start.elapsed().as_secs_f64());
 
-            // Create new decoder synchronously - this is simpler and more reliable
-            let new_decoder = {
-                let video_path_clone = video_path.to_string();
-                let available_hw_clone = available_hw.clone();
-                tokio::task::spawn_blocking(move || {
-                    let decoder_builder = if available_hw_clone.contains(&HardwareAccelerationDeviceType::VaApi) {
-                        DecoderBuilder::new(std::path::Path::new(&video_path_clone))
-                            .with_hardware_acceleration(HardwareAccelerationDeviceType::VaApi)
-                    } else if available_hw_clone.contains(&HardwareAccelerationDeviceType::Cuda) {
-                        DecoderBuilder::new(std::path::Path::new(&video_path_clone))
-                            .with_hardware_acceleration(HardwareAccelerationDeviceType::Cuda)
-                    } else if available_hw_clone.contains(&HardwareAccelerationDeviceType::VideoToolbox) {
-                        DecoderBuilder::new(std::path::Path::new(&video_path_clone))
-                            .with_hardware_acceleration(HardwareAccelerationDeviceType::VideoToolbox)
-                    } else {
-                        DecoderBuilder::new(std::path::Path::new(&video_path_clone))
-                    };
-                    decoder_builder.build()
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to spawn decoder creation task: {}", e))?
-                .map_err(|e| anyhow::anyhow!("Failed to recreate decoder: {}", e))?
-            };
-
-            info!("New decoder created in {:.2}ms", switch_start.elapsed().as_secs_f64() * 1000.0);
-
-            // Replace decoder - explicitly drop old decoder first to release resources
-            {
-                let mut decoder_guard = decoder_arc.lock().await;
-                *decoder_guard = new_decoder;
-            }
-
-            // Try to seek to the beginning of the video to initialize hardware acceleration
-            // This is a workaround for video-rs not having explicit seek support
-            // We decode and discard the first few frames to warm up the decoder
-            info!("Seeking to beginning by decoding frames...");
-            for _ in 0..2 {
-                let _ = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    async {
-                        let mut decoder_guard = decoder_arc.lock().await;
-                        decoder_guard.decode()
-                    }
-                ).await;
-            }
-
-            // Reset state - but keep last_pts to maintain timing continuity
-            frame_count = 0;
-            // Don't reset last_pts to avoid timing issues on loop
-            // last_pts = None;
-            frame_time_ms = 33;
-            need_restart = false;
-
-            info!("Decoder reinitialized and seeked to beginning in {:.2}ms, continuing decode", switch_start.elapsed().as_secs_f64() * 1000.0);
-            continue;
-        }
 
         // Only check pause flag every 10 frames to reduce lock contention
         if frame_count % 10 == 0 && *is_paused.lock().await {
@@ -293,9 +232,15 @@ async fn decode_video_async(
             Ok(Err(e)) => {
                 let error_msg = e.to_string().to_lowercase();
                 if error_msg.contains("end") || error_msg.contains("eof") || error_msg.contains("exhausted") {
-                    // End of video, loop back
-                    info!("Video ended, will restart decoder");
-                    need_restart = true;
+                    // End of video, loop back using seek(0)
+                    info!("Video ended, seeking to beginning");
+                    let mut decoder_guard = decoder_arc.lock().await;
+                    let _ = decoder_guard.seek(0);
+                    
+                    // Reset frame tracking
+                    frame_count = 0;
+                    last_pts = None;
+                    frame_time_ms = 33;
                 } else {
                     error!("Decode error: {}", e);
                     break;
@@ -304,7 +249,7 @@ async fn decode_video_async(
             Err(_) => {
                 // Timeout
                 error!("Decode timeout after 5 seconds");
-                need_restart = true;
+                break;
             }
         }
     }
@@ -606,8 +551,16 @@ async fn render_frames_async(
         let recv_start = std::time::Instant::now();
         match tokio::time::timeout(Duration::from_millis(1), rx.recv()).await {
             Ok(Some(frame_data)) => {
-                let recv_duration = recv_start.elapsed();
                 frame_count += 1;
+
+                // Detect loop restart (frame_time reset to default 33ms after > 100 frames)
+                if frame_data.frame_time == 33 && frame_count > 100 {
+                    // Loop detected, reset timing and frame count
+                    frame_count = 0;
+                    first_frame_time = Some(std::time::Instant::now());
+                    next_frame_time = std::time::Instant::now();
+                    info!("Loop detected, resetting frame count and timing");
+                }
 
                 // Log frame receive time gap
                 if let Some(last) = last_frame_time {
