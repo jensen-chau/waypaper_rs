@@ -452,14 +452,14 @@ async fn decode_video_async(
                                         ffmpeg::format::Pixel::BGRA,
                                         output_width,
                                         output_height,
-                                        Flags::BILINEAR,
+                                        Flags::FAST_BILINEAR, // 使用更快的算法
                                     ).map_err(|e| anyhow::anyhow!("Failed to create scaler: {}", e))?);
                                     first_frame_decoded = true;
                                 }
 
                                 sw_frame
                             } else {
-                                // 在第一帧后创建缩放器
+                                // 如果已经是软件帧，检查是否需要缩放
                                 if !first_frame_decoded {
                                     let sw_format = decoded.format();
                                     let sw_width = decoded.width();
@@ -473,18 +473,22 @@ async fn decode_video_async(
                                         ffmpeg::format::Pixel::BGRA,
                                         output_width,
                                         output_height,
-                                        Flags::BILINEAR,
+                                        Flags::FAST_BILINEAR, // 使用更快的算法
                                     ).map_err(|e| anyhow::anyhow!("Failed to create scaler: {}", e))?);
                                     first_frame_decoded = true;
                                 }
-
                                 decoded
                             };
 
                             // Scale and convert frame to BGRA
                             let mut final_bgra_frame = Video::empty();
-                            scaler.as_mut().unwrap().run(&bgra_frame, &mut final_bgra_frame)
-                                .map_err(|e| anyhow::anyhow!("Failed to scale frame: {}", e))?;
+                            if let Some(ref mut scaler) = scaler {
+                                scaler.run(&bgra_frame, &mut final_bgra_frame)
+                                    .map_err(|e| anyhow::anyhow!("Failed to scale frame: {}", e))?;
+                            } else {
+                                // No scaler yet, use as-is
+                                final_bgra_frame = bgra_frame;
+                            }
 
                             let frame_data = extract_frame_data(&final_bgra_frame, output_width, output_height)?;
 
