@@ -644,10 +644,8 @@ async fn render_frames_async(
                     wayland_app.render_frame(&frame_data.frame, frame_data.width, frame_data.height)
                 {
                     error!("Failed to render frame: {}", e);
-                }
-
-                // 只在每 5 帧才 dispatch 一次，减少 CPU 占用
-                if frame_count % 5 == 0 {
+                } else {
+                    // 每帧都 dispatch 以保持流畅
                     if let Err(e) = wayland_app.dispatch_events() {
                         error!("Failed to dispatch Wayland events: {}", e);
                     }
@@ -666,7 +664,7 @@ async fn render_frames_async(
                     0.0
                 };
 
-                if frame_count % 30 == 0 {
+                if frame_count % 60 == 0 {
                     let total_elapsed = start_time.elapsed();
                     info!(
                         "Render {}: {}x{}, frame_time={}ms, render_time={:.2}ms, total_elapsed={:.2}s, FPS={:.2}",

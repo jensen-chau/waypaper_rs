@@ -31,12 +31,10 @@ pub struct WaylandApp {
     pub configured: bool,
     pub configured_width: u32,
     pub configured_height: u32,
-    pub frame_count: u64,
+pub frame_count: u64,
     pub pool_size: i32,
     pub output_width: u32,
     pub output_height: u32,
-    pub needs_dispatch: bool, // 标记是否需要 dispatch
-    pub dispatch_counter: u32, // dispatch 计数器
 }
 
 // 实现 Send 以便在异步任务中使用
@@ -73,8 +71,6 @@ impl WaylandApp {
             pool_size,
             output_width: 1920, // Default to 1920x1080
             output_height: 1080,
-            needs_dispatch: false,
-            dispatch_counter: 0,
         };
         
         // Create event queue
@@ -239,9 +235,6 @@ impl WaylandApp {
         surface.commit();
         let commit_time = commit_start.elapsed();
 
-        // 标记需要 dispatch
-        self.needs_dispatch = true;
-
         // Log timing every 30 frames
         static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
@@ -256,9 +249,8 @@ impl WaylandApp {
     }
 
     pub fn dispatch_events(&mut self) -> Result<()> {
-        // 每 5 帧才 dispatch 一次，减少 CPU 占用
-        self.dispatch_counter += 1;
-        if self.dispatch_counter % 5 == 0 && self.queue.is_some() {
+        // 每帧都 dispatch，但使用 roundtrip 保持流畅
+        if self.queue.is_some() {
             let mut queue = self.queue.take().unwrap();
             let result = queue.roundtrip(self);
             self.queue = Some(queue);
