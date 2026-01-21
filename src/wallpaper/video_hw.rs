@@ -371,6 +371,7 @@ async fn decode_video_async(
             // 先解码第一帧以获取实际的硬件帧格式
             let mut scaler: Option<Context> = None;
             let mut first_frame_decoded = false;
+            let mut use_hw_scaling = false;  // 是否使用硬件缩放
 
             loop {
                 // 每 100 帧才检查一次 stop 标志，减少锁竞争
