@@ -628,10 +628,11 @@ async fn render_frames_async(
                     wayland_app.render_frame(&frame_data.frame, frame_data.width, frame_data.height)
                 {
                     error!("Failed to render frame: {}", e);
-                }
-
-                if let Err(e) = wayland_app.dispatch_events() {
-                    error!("Failed to dispatch Wayland events: {}", e);
+                } else {
+                    // 只在成功渲染后才 dispatch
+                    if let Err(e) = wayland_app.dispatch_events() {
+                        error!("Failed to dispatch Wayland events: {}", e);
+                    }
                 }
 
                 let render_time = render_start.elapsed();

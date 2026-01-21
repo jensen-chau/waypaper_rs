@@ -847,6 +847,7 @@ dependencies = [
  "clap",
  "env_logger",
  "ffmpeg-next",
+ "libc",
  "log",
  "memmap2",
  "serde",
