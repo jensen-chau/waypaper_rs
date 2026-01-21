@@ -212,9 +212,220 @@ impl HardwareDecoder {
             return Err(anyhow::anyhow!("GPU scaling only supported for VAAPI"));
         }
 
-        // 直接返回错误，使用软件缩放代替
-        // 硬件缩放的 filter 链配置太复杂，容易出问题
-        Err(anyhow::anyhow!("Hardware scaling disabled, use software scaling"))
+        // 使用 FFmpeg 的 scale_vaapi filter 进行硬件缩放
+        // 简化版本：直接在硬件帧上操作
+        unsafe {
+            // 创建 filter graph
+            let mut graph_ptr: *mut ffmpeg::ffi::AVFilterGraph = std::ptr::null_mut();
+            graph_ptr = ffmpeg::ffi::avfilter_graph_alloc();
+            if graph_ptr.is_null() {
+                return Err(anyhow::anyhow!("Failed to allocate filter graph"));
+            }
+
+            // 创建 buffer filter (输入) - 使用硬件帧格式
+            let buffer_src = ffmpeg::ffi::avfilter_get_by_name(b"buffer\0".as_ptr() as *const i8);
+            if buffer_src.is_null() {
+                return Err(anyhow::anyhow!("Failed to find buffer filter"));
+            }
+
+            let mut buffer_src_ctx: *mut ffmpeg::ffi::AVFilterContext = std::ptr::null_mut();
+            
+            // 获取源帧的实际格式
+            let src_format = src_frame.format();
+            let src_format_str = match src_format {
+                ffmpeg::format::Pixel::NV12 => "nv12",
+                ffmpeg::format::Pixel::YUV420P => "yuv420p",
+                _ => "nv12",  // 默认使用 nv12
+            };
+            
+            let args = format!(
+                "video_size={}x{}:pix_fmt={}:time_base=1/30:pixel_aspect=1/1",
+                src_frame.width(),
+                src_frame.height(),
+                src_format_str
+            );
+            let args_cstr = std::ffi::CString::new(args).unwrap();
+            
+            let ret = ffmpeg::ffi::avfilter_graph_create_filter(
+                &mut buffer_src_ctx,
+                buffer_src,
+                b"in\0".as_ptr() as *const i8,
+                args_cstr.as_ptr(),
+                std::ptr::null_mut(),
+                graph_ptr,
+            );
+            if ret < 0 {
+                return Err(anyhow::anyhow!("Failed to create buffer source filter: {}", ret));
+            }
+
+            // 创建 hwupload filter (将软件帧上传到硬件)
+            let hwupload = ffmpeg::ffi::avfilter_get_by_name(b"hwupload\0".as_ptr() as *const i8);
+            if hwupload.is_null() {
+                return Err(anyhow::anyhow!("Failed to find hwupload filter"));
+            }
+
+            let mut hwupload_ctx: *mut ffmpeg::ffi::AVFilterContext = std::ptr::null_mut();
+            // hwupload filter 不需要创建时的参数
+            let ret = ffmpeg::ffi::avfilter_graph_create_filter(
+                &mut hwupload_ctx,
+                hwupload,
+                b"upload\0".as_ptr() as *const i8,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                graph_ptr,
+            );
+            if ret < 0 {
+                return Err(anyhow::anyhow!("Failed to create hwupload filter: {}", ret));
+            }
+
+            // 设置硬件设备上下文到 hwupload filter 的私有数据
+            if let Some(hw_device_ctx) = self.hw_device_ctx {
+                // 获取 hwupload filter 的私有数据
+                let hwupload_priv = (*hwupload_ctx).priv_;
+                if hwupload_priv.is_null() {
+                    return Err(anyhow::anyhow!("Failed to get hwupload private data"));
+                }
+                
+                // 直接设置 hw_device_ctx 字段
+                // FFmpeg 的 hwupload filter 私有数据的第一个字段就是 hw_device_ctx
+                *(hwupload_priv as *mut *mut ffmpeg::ffi::AVBufferRef) = hw_device_ctx;
+            } else {
+                return Err(anyhow::anyhow!("No hardware device context available"));
+            }
+
+            // 创建 scale_vaapi filter
+            let scale_vaapi = ffmpeg::ffi::avfilter_get_by_name(b"scale_vaapi\0".as_ptr() as *const i8);
+            if scale_vaapi.is_null() {
+                return Err(anyhow::anyhow!("Failed to find scale_vaapi filter"));
+            }
+
+            let mut scale_ctx: *mut ffmpeg::ffi::AVFilterContext = std::ptr::null_mut();
+            let scale_args = format!("w={}:h={}:mode=fast", dst_width, dst_height);
+            let scale_args_cstr = std::ffi::CString::new(scale_args).unwrap();
+            
+            let ret = ffmpeg::ffi::avfilter_graph_create_filter(
+                &mut scale_ctx,
+                scale_vaapi,
+                b"scale\0".as_ptr() as *const i8,
+                scale_args_cstr.as_ptr(),
+                std::ptr::null_mut(),
+                graph_ptr,
+            );
+            if ret < 0 {
+                return Err(anyhow::anyhow!("Failed to create scale_vaapi filter: {}", ret));
+            }
+
+            // 创建 hwdownload filter (将硬件帧下载到软件帧)
+            let hwdownload = ffmpeg::ffi::avfilter_get_by_name(b"hwdownload\0".as_ptr() as *const i8);
+            if hwdownload.is_null() {
+                return Err(anyhow::anyhow!("Failed to find hwdownload filter"));
+            }
+
+            let mut hwdownload_ctx: *mut ffmpeg::ffi::AVFilterContext = std::ptr::null_mut();
+            let ret = ffmpeg::ffi::avfilter_graph_create_filter(
+                &mut hwdownload_ctx,
+                hwdownload,
+                b"download\0".as_ptr() as *const i8,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                graph_ptr,
+            );
+            if ret < 0 {
+                return Err(anyhow::anyhow!("Failed to create hwdownload filter: {}", ret));
+            }
+
+            // 创建 format filter (转换为 BGRA)
+            let format_filter = ffmpeg::ffi::avfilter_get_by_name(b"format\0".as_ptr() as *const i8);
+            if format_filter.is_null() {
+                return Err(anyhow::anyhow!("Failed to find format filter"));
+            }
+
+            let mut format_ctx: *mut ffmpeg::ffi::AVFilterContext = std::ptr::null_mut();
+            let format_args = "pix_fmts=bgra";
+            let format_args_cstr = std::ffi::CString::new(format_args).unwrap();
+            
+            let ret = ffmpeg::ffi::avfilter_graph_create_filter(
+                &mut format_ctx,
+                format_filter,
+                b"format\0".as_ptr() as *const i8,
+                format_args_cstr.as_ptr(),
+                std::ptr::null_mut(),
+                graph_ptr,
+            );
+            if ret < 0 {
+                return Err(anyhow::anyhow!("Failed to create format filter: {}", ret));
+            }
+
+            // 创建 buffersink filter (输出)
+            let buffersink = ffmpeg::ffi::avfilter_get_by_name(b"buffersink\0".as_ptr() as *const i8);
+            if buffersink.is_null() {
+                return Err(anyhow::anyhow!("Failed to find buffersink filter"));
+            }
+
+            let mut buffersink_ctx: *mut ffmpeg::ffi::AVFilterContext = std::ptr::null_mut();
+            let ret = ffmpeg::ffi::avfilter_graph_create_filter(
+                &mut buffersink_ctx,
+                buffersink,
+                b"out\0".as_ptr() as *const i8,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                graph_ptr,
+            );
+            if ret < 0 {
+                return Err(anyhow::anyhow!("Failed to create buffersink filter: {}", ret));
+            }
+
+            // 连接 filters: buffer_src -> hwupload -> scale_vaapi -> hwdownload -> format -> buffersink
+            let ret = ffmpeg::ffi::avfilter_link(buffer_src_ctx, 0, hwupload_ctx, 0);
+            if ret < 0 {
+                return Err(anyhow::anyhow!("Failed to link buffer_src to hwupload: {}", ret));
+            }
+
+            let ret = ffmpeg::ffi::avfilter_link(hwupload_ctx, 0, scale_ctx, 0);
+            if ret < 0 {
+                return Err(anyhow::anyhow!("Failed to link hwupload to scale_vaapi: {}", ret));
+            }
+
+            let ret = ffmpeg::ffi::avfilter_link(scale_ctx, 0, hwdownload_ctx, 0);
+            if ret < 0 {
+                return Err(anyhow::anyhow!("Failed to link scale_vaapi to hwdownload: {}", ret));
+            }
+
+            let ret = ffmpeg::ffi::avfilter_link(hwdownload_ctx, 0, format_ctx, 0);
+            if ret < 0 {
+                return Err(anyhow::anyhow!("Failed to link hwdownload to format: {}", ret));
+            }
+
+            let ret = ffmpeg::ffi::avfilter_link(format_ctx, 0, buffersink_ctx, 0);
+            if ret < 0 {
+                return Err(anyhow::anyhow!("Failed to link format to buffersink: {}", ret));
+            }
+
+            // 配置 filter graph
+            let ret = ffmpeg::ffi::avfilter_graph_config(graph_ptr, std::ptr::null_mut());
+            if ret < 0 {
+                return Err(anyhow::anyhow!("Failed to configure filter graph: {}", ret));
+            }
+
+            // 将输入帧添加到 filter graph
+            let src_ptr = src_frame.as_ptr();
+            let ret = ffmpeg::ffi::av_buffersrc_add_frame_flags(buffer_src_ctx, src_ptr as *mut ffmpeg::ffi::AVFrame, 0);
+            if ret < 0 {
+                return Err(anyhow::anyhow!("Failed to add frame to buffer src: {}", ret));
+            }
+
+            // 从 filter graph 获取输出帧
+            let dst_ptr = dst_frame.as_mut_ptr();
+            let ret = ffmpeg::ffi::av_buffersink_get_frame(buffersink_ctx, dst_ptr);
+            if ret < 0 {
+                return Err(anyhow::anyhow!("Failed to get frame from buffer sink: {}", ret));
+            }
+
+            // 清理 filter graph
+            ffmpeg::ffi::avfilter_graph_free(&mut graph_ptr);
+
+            Ok(())
+        }
     }
 }
 
