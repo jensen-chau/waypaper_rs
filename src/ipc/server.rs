@@ -94,26 +94,16 @@ async fn handle_request(
 ) -> IpcResponse {
     match request {
         IpcRequest::SetWallpaper { path } => {
-            // 检查文件是否存在
+            // 检查路径是否存在
             if !std::path::Path::new(&path).exists() {
-                return IpcResponse::error(format!("File not found: {}", path));
+                return IpcResponse::error(format!("Path not found: {}", path));
             }
 
             // 读取 project.json
-            let project_dir = std::path::Path::new(&path).parent()
-                .unwrap_or_else(|| std::path::Path::new(""));
-            let project_json_path = project_dir.join("project.json");
-            
-            let project_json_path_str = project_json_path.to_str()
-                .unwrap_or_else(|| {
-                    error!("Failed to convert project.json path to string");
-                    return "";
-                });
-
-            let project = match build_project(project_json_path_str) {
+            let project = match build_project(path.as_str()) {
                 Ok(p) => p,
                 Err(e) => {
-                    error!("Failed to load project.json: {}", e);
+                    error!("Failed to load project.json: {} (path: {:?})", e, path);
                     return IpcResponse::error(format!("Failed to load project.json: {}", e));
                 }
             };
@@ -121,7 +111,15 @@ async fn handle_request(
             // 根据 project.json 创建相应的壁纸实例
             let wallpaper: Box<dyn Wallpaper + Send> = match project.wallpaper_type.to_lowercase().as_str() {
                 "video" => {
-                    let mut video_wallpaper = VideoWallpaper::new(path.clone(), WallpaperType::Video);
+                    // 构建视频文件的完整路径
+                    let video_file_path = format!("{}/{}", path, project.file);
+                    
+                    // 检查视频文件是否存在
+                    if !std::path::Path::new(&video_file_path).exists() {
+                        return IpcResponse::error(format!("Video file not found: {}", video_file_path));
+                    }
+                    
+                    let mut video_wallpaper = VideoWallpaper::new(video_file_path, WallpaperType::Video);
                     // 设置性能优化参数
                     video_wallpaper.set_target_fps(30);
                     video_wallpaper.set_max_resolution(1280, 720);
@@ -135,8 +133,8 @@ async fn handle_request(
             // 设置到 player
             {
                 let mut player = player.lock().await;
-                player.set_wallpaper(wallpaper);
-                player.run();
+                player.set_wallpaper(wallpaper).await;
+                player.run().await;
             }
 
             info!("Wallpaper set: {} (type: {})", path, project.wallpaper_type);
@@ -144,20 +142,20 @@ async fn handle_request(
         }
         IpcRequest::GetWallpaper => {
             let player = player.lock().await;
-            let is_running = player.is_running();
+            let is_running = player.is_running().await;
             IpcResponse::success(format!("Player status: {}", if is_running { "Running" } else { "Stopped" }))
         }
         IpcRequest::GetStatus => {
             let player = player.lock().await;
-            let is_running = player.is_running();
+            let is_running = player.is_running().await;
             IpcResponse::status(is_running)
         }
         IpcRequest::Shutdown => {
             // 停止壁纸
             {
                 let mut player = player.lock().await;
-                player.stop();
-                player.clear();
+                player.stop().await;
+                player.clear().await;
             }
             IpcResponse::success("Server is closing".to_string())
         }

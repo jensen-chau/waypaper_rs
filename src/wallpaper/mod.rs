@@ -13,7 +13,7 @@ pub enum WallpaperError {
     UnknownWallpaperType(String),
 }
 
-pub trait Wallpaper {
+pub trait Wallpaper: Send + Sync {
     fn play(&mut self);
     fn pause(&mut self);
     fn run(&mut self);

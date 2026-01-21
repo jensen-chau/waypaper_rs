@@ -563,6 +563,9 @@ impl Wallpaper for VideoWallpaper {
             render_frames_async(rx, is_paused_render, is_stopped_render).await;
         });
         self.render_task = Some(render_task);
+        
+        // 阻塞一小段时间，确保异步任务被调度器接管
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
     fn info(&self) {}

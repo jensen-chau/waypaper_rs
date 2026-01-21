@@ -18,10 +18,10 @@ pub struct Project {
 }
 
 pub fn build_project(path: &str) -> Result<Project> {
-    let dir = PathBuf::from_str(path).unwrap();
+    let dir = PathBuf::from_str(path)?;
     let project_path = dir.join("project.json");
-    let project_file = File::open(project_path).unwrap();
-    let project: Project = serde_json::from_reader(project_file).unwrap();
+    let project_file = File::open(&project_path)?;
+    let project: Project = serde_json::from_reader(project_file)?;
     Ok(project)
 }
 

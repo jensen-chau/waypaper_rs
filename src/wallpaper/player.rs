@@ -21,63 +21,63 @@ impl Player {
     }
 
     /// 设置壁纸
-    pub fn set_wallpaper(&mut self, wallpaper: Box<dyn Wallpaper + Send>) {
+    pub async fn set_wallpaper(&mut self, wallpaper: Box<dyn Wallpaper + Send>) {
         // 停止当前壁纸（如果存在）
         if let Some(mut w) = self.wallpaper.take() {
             w.pause();
         }
 
         self.wallpaper = Some(wallpaper);
-        *self.is_running.blocking_lock() = true;
+        *self.is_running.lock().await = true;
     }
 
     /// 播放壁纸
-    pub fn play(&mut self) {
+    pub async fn play(&mut self) {
         if let Some(wallpaper) = &mut self.wallpaper {
             wallpaper.play();
-            *self.is_running.blocking_lock() = true;
+            *self.is_running.lock().await = true;
         }
     }
 
     /// 暂停壁纸
-    pub fn pause(&mut self) {
+    pub async fn pause(&mut self) {
         if let Some(wallpaper) = &mut self.wallpaper {
             wallpaper.pause();
-            *self.is_running.blocking_lock() = false;
+            *self.is_running.lock().await = false;
         }
     }
 
     /// 运行壁纸（启动播放循环）
-    pub fn run(&mut self) {
+    pub async fn run(&mut self) {
         if let Some(wallpaper) = &mut self.wallpaper {
             wallpaper.run();
-            *self.is_running.blocking_lock() = true;
+            *self.is_running.lock().await = true;
         }
     }
 
     /// 停止壁纸
-    pub fn stop(&mut self) {
+    pub async fn stop(&mut self) {
         if let Some(wallpaper) = &mut self.wallpaper {
             wallpaper.pause();
-            *self.is_running.blocking_lock() = false;
+            *self.is_running.lock().await = false;
         }
     }
 
     /// 检查是否正在运行
-    pub fn is_running(&self) -> bool {
-        *self.is_running.blocking_lock()
+    pub async fn is_running(&self) -> bool {
+        *self.is_running.lock().await
     }
 
     /// 获取壁纸信息
-    pub fn info(&self) {
+    pub async fn info(&self) {
         if let Some(wallpaper) = &self.wallpaper {
             wallpaper.info();
         }
     }
 
     /// 清除当前壁纸
-    pub fn clear(&mut self) {
-        self.stop();
+    pub async fn clear(&mut self) {
+        self.stop().await;
         self.wallpaper = None;
     }
 }
