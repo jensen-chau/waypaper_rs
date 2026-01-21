@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::fs::File;
 use std::io::{Seek, Write};
-use std::os::unix::io::{AsFd, AsRawFd};
+use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd};
 use wayland_client::protocol::{
     wl_buffer, wl_compositor, wl_display, wl_output, wl_registry, wl_seat, wl_shm, wl_shm_pool,
     wl_surface,
@@ -12,6 +12,7 @@ use wayland_client::{
 };
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
+use wayland_protocols::wp::linux_dmabuf::zv1::client::{zwp_linux_dmabuf_v1, zwp_linux_buffer_params_v1};
 
 pub struct WaylandApp {
     pub conn: Connection,
@@ -39,6 +40,9 @@ pub struct WaylandApp {
     // Viewporter 支持
     pub viewporter: Option<wp_viewporter::WpViewporter>,
     pub viewport: Option<wp_viewport::WpViewport>,
+    // DMA-BUF 支持
+    pub linux_dmabuf: Option<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1>,
+    pub dmabuf_formats: Vec<u32>,
 }
 
 // 实现 Send 以便在异步任务中使用
@@ -77,6 +81,8 @@ impl WaylandApp {
             output_height: 1080,
             viewporter: None,
             viewport: None,
+            linux_dmabuf: None,
+            dmabuf_formats: Vec::new(),
         };
         
         // Create event queue
@@ -282,7 +288,68 @@ impl WaylandApp {
         }
         Ok(())
     }
+
+    pub fn render_frame_dmabuf(
+        &mut self,
+        fd: i32,
+        width: u32,
+        height: u32,
+        stride: u32,
+        format: u32,
+        modifier_hi: u32,
+        modifier_lo: u32,
+    ) -> Result<()> {
+        if !self.configured {
+            return Ok(());
+        }
+
+        let surface = self.surface.as_ref().ok_or_else(|| anyhow::anyhow!("Surface not available"))?;
+        let linux_dmabuf = self.linux_dmabuf.as_ref().ok_or_else(|| anyhow::anyhow!("DMA-BUF not available"))?;
+
+        let queue = self.queue.as_mut().ok_or_else(|| anyhow::anyhow!("Queue not available"))?;
+        let qh = queue.handle();
+
+        // 添加调试日志
+        log::info!("DMA-BUF params: fd={}, width={}, height={}, stride={}, format=0x{:08x}, modifier_hi=0x{:08x}, modifier_lo=0x{:08x}",
+                   fd, width, height, stride, format, modifier_hi, modifier_lo);
+
+        let params = linux_dmabuf.create_params(&qh, ());
+        let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
+        params.add(borrowed_fd, 0, 0, stride, modifier_hi, modifier_lo);
+        use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::Flags;
+        let buffer = params.create_immed(width as i32, height as i32, format, Flags::empty(), &qh, ());
+
+        surface.attach(Some(&buffer), 0, 0);
+        surface.damage(0, 0, width as i32, height as i32);
+        surface.commit();
+
+        Ok(())
+    }
 }
+
+impl Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, ()> for WaylandApp {
+    fn event(
+        _state: &mut Self,
+        _proxy: &zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
+        event: zwp_linux_buffer_params_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_linux_buffer_params_v1::Event::Created { buffer } => {
+                // The buffer is created, we can now use it.
+                // In this example, we don't need to do anything here,
+                // as we are creating the buffer and using it immediately.
+            }
+            zwp_linux_buffer_params_v1::Event::Failed => {
+                log::error!("Failed to create DMA-BUF buffer");
+            }
+            _ => {}
+        }
+    }
+}
+
 
 // Dispatch implementations
 impl Dispatch<wl_compositor::WlCompositor, ()> for WaylandApp {
@@ -457,6 +524,24 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for WaylandApp {
     }
 }
 
+impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for WaylandApp {
+    fn event(
+        state: &mut Self,
+        _proxy: &zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+        event: zwp_linux_dmabuf_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_linux_dmabuf_v1::Event::Format { format } => {
+                state.dmabuf_formats.push(format);
+            }
+            _ => {}
+        }
+    }
+}
+
 impl Dispatch<wl_registry::WlRegistry, ()> for WaylandApp {
     fn event(
         state: &mut Self,
@@ -511,6 +596,15 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandApp {
                             (),
                         ));
                         log::info!("Bound wp_viewporter");
+                    }
+                    "zwp_linux_dmabuf_v1" => {
+                        state.linux_dmabuf = Some(registry.bind::<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, _, _>(
+                            name,
+                            4,
+                            qhandle,
+                            (),
+                        ));
+                        log::info!("Bound zwp_linux_dmabuf_v1");
                     }
                     _ => {}
                 }

@@ -1,4 +1,4 @@
-use log::{error, info, warn};
+use log::{error, info, warn, debug};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, mpsc};
@@ -453,6 +453,10 @@ pub struct VideoWallpaper {
     project: Option<project::Project>,
     wallpaper_type: WallpaperType,
     hw_accel_type: HardwareAcceleration,
+    target_fps: u32,  // 目标帧率，默认 30fps
+    skip_frames: u32,  // 跳帧计数
+    max_width: u32,  // 最大宽度，0 表示不限制
+    max_height: u32,  // 最大高度，0 表示不限制
 }
 
 pub struct FrameData {
@@ -490,7 +494,28 @@ impl VideoWallpaper {
             project: None,
             wallpaper_type,
             hw_accel_type: HardwareAcceleration::VAAPI, // 默认使用 VAAPI
+            target_fps: 30,  // 默认 30fps，减少 CPU 占用
+            skip_frames: 0,
+            max_width: 1920,  // 默认最大宽度 1920
+            max_height: 1080,  // 默认最大高度 1080
         }
+    }
+
+    /// 设置目标帧率
+    pub fn set_target_fps(&mut self, fps: u32) {
+        self.target_fps = fps.max(15).min(60);  // 限制在 15-60fps 之间
+    }
+
+    /// 设置最大分辨率
+    pub fn set_max_resolution(&mut self, width: u32, height: u32) {
+        self.max_width = width;
+        self.max_height = height;
+    }
+
+    /// 禁用分辨率限制（使用原始分辨率）
+    pub fn disable_resolution_limit(&mut self) {
+        self.max_width = 0;
+        self.max_height = 0;
     }
 
     /// 设置硬件加速类型
@@ -518,6 +543,9 @@ impl Wallpaper for VideoWallpaper {
         let is_paused = self.is_paused.clone();
         let is_stopped = self.is_stopped.clone();
         let hw_accel_type = self.hw_accel_type;
+        let target_fps = self.target_fps;
+        let max_width = self.max_width;
+        let max_height = self.max_height;
 
         let is_paused_render = is_paused.clone();
         let is_stopped_render = is_stopped.clone();
@@ -525,7 +553,7 @@ impl Wallpaper for VideoWallpaper {
         let handle = tokio::runtime::Handle::current();
 
         let decode_task = handle.spawn(async move {
-            if let Err(e) = decode_video_async(&video_path, tx, is_paused, is_stopped, hw_accel_type).await {
+            if let Err(e) = decode_video_async(&video_path, tx, is_paused, is_stopped, hw_accel_type, target_fps, max_width, max_height).await {
                 error!("Video decode error: {}", e);
             }
         });
@@ -546,27 +574,31 @@ async fn decode_video_async(
     is_paused: Arc<Mutex<bool>>,
     is_stopped: Arc<Mutex<bool>>,
     hw_accel_type: HardwareAcceleration,
+    target_fps: u32,
+    max_width: u32,
+    max_height: u32,
 ) -> Result<()> {
-    info!("decode_video_async started with hardware acceleration: {:?}", hw_accel_type);
+    debug!("decode_video_async started with hardware acceleration: {:?}, target_fps: {}, max_resolution: {}x{}",
+           hw_accel_type, target_fps, max_width, max_height);
     let video_path = video_path.to_string();
     // 使用视频原始尺寸，让 Wayland viewporter 处理缩放
     let output_width = 0u32;  // 将在解码后获取
     let output_height = 0u32;
 
     tokio::task::spawn_blocking::<_, Result<()>>(move || {
-        info!("spawn_blocking thread started");
+        debug!("spawn_blocking thread started");
 
         // Initialize ffmpeg
-        info!("Initializing ffmpeg...");
+        debug!("Initializing ffmpeg...");
         ffmpeg::init().map_err(|e| anyhow::anyhow!("Failed to initialize ffmpeg: {}", e))?;
-        info!("ffmpeg initialized successfully");
+        debug!("ffmpeg initialized successfully");
 
-        info!("Opening video: {}", video_path);
+        debug!("Opening video: {}", video_path);
 
         // Open input file
         let mut ictx = input(&video_path)
             .map_err(|e| anyhow::anyhow!("Failed to open video file: {}", e))?;
-        info!("Video file opened successfully");
+        debug!("Video file opened successfully");
 
         // Find best video stream
         let input_stream = ictx
@@ -574,11 +606,11 @@ async fn decode_video_async(
             .best(Type::Video)
             .ok_or_else(|| anyhow::anyhow!("No video stream found"))?;
         let video_stream_index = input_stream.index();
-        info!("Found video stream at index {}", video_stream_index);
+        debug!("Found video stream at index {}", video_stream_index);
 
         // Get stream time base for timestamp conversion
         let time_base = input_stream.time_base();
-        info!("Stream time base: {}/{}", time_base.numerator(), time_base.denominator());
+        debug!("Stream time base: {}/{}", time_base.numerator(), time_base.denominator());
 
         // Create decoder
         let context_decoder = ffmpeg::codec::context::Context::from_parameters(input_stream.parameters())
@@ -586,31 +618,52 @@ async fn decode_video_async(
         let mut decoder = context_decoder.decoder().video()
             .map_err(|e| anyhow::anyhow!("Failed to create video decoder: {}", e))?;
 
-        info!("Decoder created successfully");
+        debug!("Decoder created successfully");
 
         // Initialize hardware decoder if enabled
         let mut hw_decoder = HardwareDecoder::new(hw_accel_type)?;
         hw_decoder.configure_decoder(&mut decoder)?;
-        info!("Hardware decoder configured: {:?}", hw_accel_type);
+        debug!("Hardware decoder configured: {:?}", hw_accel_type);
 
-        info!("Video opened: {}x{} (BGRA), Wayland viewporter will handle scaling",
-              decoder.width(), decoder.height());
+        info!("Video opened: {}x{}, target_fps: {}",
+              decoder.width(), decoder.height(), target_fps);
 
         let mut frame_count = 0u64;
         let mut last_pts: Option<i64> = None;
         let mut frame_time_ms: u32 = 33;
+        let mut skip_counter = 0u32;  // 跳帧计数器
+        let target_frame_interval = 1000 / target_fps;  // 目标帧间隔（毫秒）
+
+        // 计算缩放比例
+        let (scale_width, scale_height) = if max_width > 0 && max_height > 0 {
+            let orig_width = decoder.width();
+            let orig_height = decoder.height();
+            
+            // 计算缩放比例，保持宽高比
+            let scale_x = max_width as f32 / orig_width as f32;
+            let scale_y = max_height as f32 / orig_height as f32;
+            let scale = scale_x.min(scale_y).min(1.0);  // 不放大，只缩小
+            
+            let new_width = (orig_width as f32 * scale) as u32;
+            let new_height = (orig_height as f32 * scale) as u32;
+            
+            info!("Resolution scaling: {}x{} -> {}x{} (scale: {:.2})",
+                  orig_width, orig_height, new_width, new_height, scale);
+            
+            (Some(new_width), Some(new_height))
+        } else {
+            (None, None)
+        };
 
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| anyhow::anyhow!("Failed to create runtime: {}", e))?;
 
         let result = rt.block_on(async move {
             let mut decoder = decoder;
-
-            info!("Starting decode loop...");
-            let mut packet_count = 0u64;
-
-            // 不使用缩放器,让 Wayland viewporter 处理缩放
             let mut first_decoded = false;
+
+            info!("Starting decode loop with target_fps: {}...", target_fps);
+            let mut packet_count = 0u64;
 
             loop {
                 // 每 100 帧才检查一次 stop 标志，减少锁竞争
@@ -628,7 +681,7 @@ async fn decode_video_async(
                 let (stream, packet) = match ictx.packets().next() {
                     Some((s, p)) => (s, p),
                     None => {
-                        info!("Video ended, seeking to beginning");
+                        debug!("Video ended, seeking to beginning");
                         let _ = ictx.seek(0, ..);
                         frame_count = 0;
                         last_pts = None;
@@ -638,8 +691,8 @@ async fn decode_video_async(
                 };
 
                 packet_count += 1;
-                if packet_count % 100 == 0 {
-                    info!("Processed {} packets", packet_count);
+                if packet_count % 1000 == 0 {
+                    debug!("Processed {} packets", packet_count);
                 }
 
                 if stream.index() == video_stream_index {
@@ -658,8 +711,22 @@ async fn decode_video_async(
 
                             frame_count += 1;
 
-                            if frame_count == 1 {
-                                info!("Successfully decoded first frame");
+                            // 跳帧逻辑：根据目标帧率跳过部分帧
+                            skip_counter += 1;
+                            let video_fps = if frame_time_ms > 0 { 1000 / frame_time_ms } else { 60 };
+                            let skip_ratio = if video_fps > target_fps {
+                                (video_fps as f32 / target_fps as f32).ceil() as u32
+                            } else {
+                                1
+                            };
+
+                            // 跳过不需要的帧
+                            if skip_counter % skip_ratio != 0 {
+                                continue;
+                            }
+
+                            if frame_count == 1 || frame_count % 1000 == 0 {
+                                debug!("Decoded frame {} (skipping ratio: {})", frame_count, skip_ratio);
                             }
 
                             // Check if frame is in hardware format
@@ -683,15 +750,18 @@ let bgra_frame = if is_hw_frame {
                                 decoded
                             };
 
-// 转换为 BGRA 格式（如果还不是）
+// 转换为 BGRA 格式（如果还不是），并应用分辨率缩放
                             let mut bgra_frame_converted = Video::empty();
+                            let target_width = scale_width.unwrap_or(bgra_frame.width());
+                            let target_height = scale_height.unwrap_or(bgra_frame.height());
+                            
                             if bgra_frame.format() != ffmpeg::format::Pixel::BGRA {
                                 let sw_format = bgra_frame.format();
                                 let sw_width = bgra_frame.width();
                                 let sw_height = bgra_frame.height();
                                 
                                 if !first_decoded {
-                                    info!("Converting from {:?} to BGRA", sw_format);
+                                    debug!("Converting from {:?} to BGRA", sw_format);
                                     first_decoded = true;
                                 }
                                 
@@ -700,17 +770,32 @@ let bgra_frame = if is_hw_frame {
                                     sw_width,
                                     sw_height,
                                     ffmpeg::format::Pixel::BGRA,
-                                    sw_width,
-                                    sw_height,
+                                    target_width,
+                                    target_height,
                                     Flags::FAST_BILINEAR,
                                 ).map_err(|e| anyhow::anyhow!("Failed to create format converter: {}", e))?;
                                 converter.run(&bgra_frame, &mut bgra_frame_converted)
                                     .map_err(|e| anyhow::anyhow!("Failed to convert frame format: {}", e))?;
                             } else {
-                                bgra_frame_converted = bgra_frame;
+                                // 已经是 BGRA 格式，但需要缩放
+                                if bgra_frame.width() != target_width || bgra_frame.height() != target_height {
+                                    let mut converter = Context::get(
+                                        ffmpeg::format::Pixel::BGRA,
+                                        bgra_frame.width(),
+                                        bgra_frame.height(),
+                                        ffmpeg::format::Pixel::BGRA,
+                                        target_width,
+                                        target_height,
+                                        Flags::FAST_BILINEAR,
+                                    ).map_err(|e| anyhow::anyhow!("Failed to create scaler: {}", e))?;
+                                    converter.run(&bgra_frame, &mut bgra_frame_converted)
+                                        .map_err(|e| anyhow::anyhow!("Failed to scale frame: {}", e))?;
+                                } else {
+                                    bgra_frame_converted = bgra_frame;
+                                }
                             }
 
-                            // 使用原始尺寸，让 Wayland viewporter 处理缩放
+                            // 使用缩放后的尺寸
                             let frame_width = bgra_frame_converted.width();
                             let frame_height = bgra_frame_converted.height();
                             let frame_data = extract_frame_data(&bgra_frame_converted, frame_width, frame_height)?;

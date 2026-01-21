@@ -29,7 +29,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // - None (软件解码)
     wallpaper.set_hardware_acceleration(HardwareAcceleration::VAAPI);
 
+    // === 性能优化配置 ===
+    
+    // 1. 设置目标帧率（默认 30fps，可设置 15-60fps）
+    // 降低帧率可以显著减少 CPU 占用
+    wallpaper.set_target_fps(30);
+    
+    // 2. 设置最大分辨率（默认 1920x1080）
+    // 降低分辨率可以大幅减少 CPU 和内存占用
+    // 4K (3840x2160) -> 1080p (1920x1080) 可以减少约 75% 的数据量
+    wallpaper.set_max_resolution(1920, 1080);
+    
+    // 如果需要使用原始分辨率，可以调用：
+    // wallpaper.disable_resolution_limit();
+    
     println!("Hardware acceleration: VAAPI enabled");
+    println!("Target FPS: 30");
+    println!("Max resolution: 1920x1080");
 
     // Run the wallpaper
     wallpaper.run();
