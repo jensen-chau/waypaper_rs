@@ -204,6 +204,129 @@ impl HardwareDecoder {
 
         Ok(())
     }
+
+    /// 在 GPU 上缩放硬件帧（仅支持 VAAPI）
+    /// 使用 VAAPI VPP (Video Post Processing) 进行硬件缩放
+    pub fn scale_frame_gpu(&self, src_frame: &Video, dst_frame: &mut Video, dst_width: i32, dst_height: i32) -> Result<()> {
+        if self.hw_accel_type != HardwareAcceleration::VAAPI {
+            return Err(anyhow::anyhow!("GPU scaling only supported for VAAPI"));
+        }
+
+        // 使用 FFmpeg 的 scale_vaapi filter 进行硬件缩放
+        // 这需要直接使用 FFmpeg C API，因为 ffmpeg-next 的 filter API 不完整
+        unsafe {
+            // 创建 filter graph
+            let mut graph_ptr: *mut ffmpeg::ffi::AVFilterGraph = std::ptr::null_mut();
+            graph_ptr = ffmpeg::ffi::avfilter_graph_alloc();
+            if graph_ptr.is_null() {
+                return Err(anyhow::anyhow!("Failed to allocate filter graph"));
+            }
+
+            // 创建 buffer filter (输入)
+            let buffer_src = ffmpeg::ffi::avfilter_get_by_name(b"buffer\0".as_ptr() as *const i8);
+            if buffer_src.is_null() {
+                return Err(anyhow::anyhow!("Failed to find buffer filter"));
+            }
+
+            let mut buffer_src_ctx: *mut ffmpeg::ffi::AVFilterContext = std::ptr::null_mut();
+            let args = format!(
+                "video_size={}x{}:pix_fmt={}:time_base=1/30:pixel_aspect=1/1",
+                src_frame.width(),
+                src_frame.height(),
+                "vaapi"
+            );
+            let args_cstr = std::ffi::CString::new(args).unwrap();
+            
+            let ret = ffmpeg::ffi::avfilter_graph_create_filter(
+                &mut buffer_src_ctx,
+                buffer_src,
+                b"in\0".as_ptr() as *const i8,
+                args_cstr.as_ptr(),
+                std::ptr::null_mut(),
+                graph_ptr,
+            );
+            if ret < 0 {
+                return Err(anyhow::anyhow!("Failed to create buffer source filter: {}", ret));
+            }
+
+            // 创建 scale_vaapi filter
+            let scale_vaapi = ffmpeg::ffi::avfilter_get_by_name(b"scale_vaapi\0".as_ptr() as *const i8);
+            if scale_vaapi.is_null() {
+                return Err(anyhow::anyhow!("Failed to find scale_vaapi filter"));
+            }
+
+            let mut scale_ctx: *mut ffmpeg::ffi::AVFilterContext = std::ptr::null_mut();
+            let scale_args = format!("w={}:h={}:format=nv12:mode=fast", dst_width, dst_height);
+            let scale_args_cstr = std::ffi::CString::new(scale_args).unwrap();
+            
+            let ret = ffmpeg::ffi::avfilter_graph_create_filter(
+                &mut scale_ctx,
+                scale_vaapi,
+                b"scale\0".as_ptr() as *const i8,
+                scale_args_cstr.as_ptr(),
+                std::ptr::null_mut(),
+                graph_ptr,
+            );
+            if ret < 0 {
+                return Err(anyhow::anyhow!("Failed to create scale_vaapi filter: {}", ret));
+            }
+
+            // 创建 buffersink filter (输出)
+            let buffersink = ffmpeg::ffi::avfilter_get_by_name(b"buffersink\0".as_ptr() as *const i8);
+            if buffersink.is_null() {
+                return Err(anyhow::anyhow!("Failed to find buffersink filter"));
+            }
+
+            let mut buffersink_ctx: *mut ffmpeg::ffi::AVFilterContext = std::ptr::null_mut();
+            let ret = ffmpeg::ffi::avfilter_graph_create_filter(
+                &mut buffersink_ctx,
+                buffersink,
+                b"out\0".as_ptr() as *const i8,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                graph_ptr,
+            );
+            if ret < 0 {
+                return Err(anyhow::anyhow!("Failed to create buffersink filter: {}", ret));
+            }
+
+            // 连接 filters
+            let ret = ffmpeg::ffi::avfilter_link(buffer_src_ctx, 0, scale_ctx, 0);
+            if ret < 0 {
+                return Err(anyhow::anyhow!("Failed to link buffer_src to scale_vaapi: {}", ret));
+            }
+
+            let ret = ffmpeg::ffi::avfilter_link(scale_ctx, 0, buffersink_ctx, 0);
+            if ret < 0 {
+                return Err(anyhow::anyhow!("Failed to link scale_vaapi to buffersink: {}", ret));
+            }
+
+            // 配置 filter graph
+            let ret = ffmpeg::ffi::avfilter_graph_config(graph_ptr, std::ptr::null_mut());
+            if ret < 0 {
+                return Err(anyhow::anyhow!("Failed to configure filter graph: {}", ret));
+            }
+
+            // 将输入帧添加到 filter graph
+            let src_ptr = src_frame.as_ptr();
+            let ret = ffmpeg::ffi::av_buffersrc_add_frame_flags(buffer_src_ctx, src_ptr as *mut ffmpeg::ffi::AVFrame, 0);
+            if ret < 0 {
+                return Err(anyhow::anyhow!("Failed to add frame to buffer src: {}", ret));
+            }
+
+            // 从 filter graph 获取输出帧
+            let dst_ptr = dst_frame.as_mut_ptr();
+            let ret = ffmpeg::ffi::av_buffersink_get_frame(buffersink_ctx, dst_ptr);
+            if ret < 0 {
+                return Err(anyhow::anyhow!("Failed to get frame from buffer sink: {}", ret));
+            }
+
+            // 清理 filter graph
+            ffmpeg::ffi::avfilter_graph_free(&mut graph_ptr);
+
+            Ok(())
+        }
+    }
 }
 
 impl Drop for HardwareDecoder {
@@ -435,36 +558,45 @@ async fn decode_video_async(
                             );
 
                             let bgra_frame = if is_hw_frame {
-                                // Transfer from hardware to software
-                                let mut sw_frame = Video::empty();
-                                hw_decoder.transfer_frame(&decoded, &mut sw_frame)?;
-
-                                // 在第一帧传输后创建缩放器
-                                if !first_frame_decoded {
-                                    let sw_format = sw_frame.format();
-                                    let sw_width = sw_frame.width();
-                                    let sw_height = sw_frame.height();
-                                    info!("Creating scaler for software frame: {}x{} format: {:?}", sw_width, sw_height, sw_format);
-
-                                    // 如果尺寸相同，不创建缩放器
-                                    if sw_width == output_width && sw_height == output_height && sw_format == ffmpeg::format::Pixel::BGRA {
-                                        info!("No scaling needed, dimensions and format match");
-                                        first_frame_decoded = true;
-                                    } else {
-                                        scaler = Some(Context::get(
-                                            sw_format,
-                                            sw_width,
-                                            sw_height,
-                                            ffmpeg::format::Pixel::BGRA,
-                                            output_width,
-                                            output_height,
-                                            Flags::FAST_BILINEAR, // 使用更快的算法
-                                        ).map_err(|e| anyhow::anyhow!("Failed to create scaler: {}", e))?);
-                                        first_frame_decoded = true;
+                                // 对于硬件帧，尝试使用硬件缩放
+                                if !first_frame_decoded && matches!(hw_accel_type, HardwareAcceleration::VAAPI) {
+                                    // 检查是否可以使用硬件缩放
+                                    let src_width = decoded.width();
+                                    let src_height = decoded.height();
+                                    
+                                    if src_width != output_width || src_height != output_height {
+                                        info!("Enabling hardware scaling: {}x{} -> {}x{}", 
+                                              src_width, src_height, output_width, output_height);
+                                        use_hw_scaling = true;
                                     }
+                                    first_frame_decoded = true;
                                 }
 
-                                sw_frame
+                                if use_hw_scaling {
+                                    // 使用硬件缩放
+                                    let mut hw_scaled_frame = Video::empty();
+                                    match hw_decoder.scale_frame_gpu(&decoded, &mut hw_scaled_frame, output_width as i32, output_height as i32) {
+                                        Ok(_) => {
+                                            // 硬件缩放成功，传输到软件帧
+                                            let mut sw_frame = Video::empty();
+                                            hw_decoder.transfer_frame(&hw_scaled_frame, &mut sw_frame)?;
+                                            sw_frame
+                                        }
+                                        Err(e) => {
+                                            // 硬件缩放失败，回退到软件缩放
+                                            warn!("Hardware scaling failed, falling back to software scaling: {}", e);
+                                            use_hw_scaling = false;
+                                            let mut sw_frame = Video::empty();
+                                            hw_decoder.transfer_frame(&decoded, &mut sw_frame)?;
+                                            sw_frame
+                                        }
+                                    }
+                                } else {
+                                    // 不需要硬件缩放，直接传输
+                                    let mut sw_frame = Video::empty();
+                                    hw_decoder.transfer_frame(&decoded, &mut sw_frame)?;
+                                    sw_frame
+                                }
                             } else {
                                 // 如果已经是软件帧，检查是否需要缩放
                                 if !first_frame_decoded {
