@@ -5,9 +5,6 @@ async fn main() -> anyhow::Result<()> {
     // 初始化日志，输出到文件
     env_logger::Builder::from_env(Env::default().default_filter_or("info"))
         .format_timestamp_millis()
-        .target(env_logger::Target::Pipe(Box::new(
-            std::fs::File::create("/tmp/daemon.log")?
-        )))
         .init();
 
     // 启动 server
