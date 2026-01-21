@@ -2,6 +2,8 @@
 
 A dynamic wallpaper application for Wayland written in Rust, supporting video wallpaper playback.
 
+> **Note**: Most of the code in this project was generated with AI assistance.
+
 ## Features
 
 - ✅ **Video Wallpapers**: Support MP4 and other video formats as dynamic wallpapers
