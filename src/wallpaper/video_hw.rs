@@ -475,6 +475,22 @@ async fn decode_video_async(
                                             use_hw_scaling = false;
                                             let mut sw_frame = Video::empty();
                                             hw_decoder.transfer_frame(&decoded, &mut sw_frame)?;
+                                            
+                                            // 创建软件缩放器
+                                            let sw_format = sw_frame.format();
+                                            let sw_width = sw_frame.width();
+                                            let sw_height = sw_frame.height();
+                                            info!("Creating software scaler after hardware scaling failed: {}x{} format: {:?}", sw_width, sw_height, sw_format);
+                                            scaler = Some(Context::get(
+                                                sw_format,
+                                                sw_width,
+                                                sw_height,
+                                                ffmpeg::format::Pixel::BGRA,
+                                                output_width,
+                                                output_height,
+                                                Flags::FAST_BILINEAR,
+                                            ).map_err(|e| anyhow::anyhow!("Failed to create scaler: {}", e))?);
+                                            
                                             sw_frame
                                         }
                                     }
