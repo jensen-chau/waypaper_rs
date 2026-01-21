@@ -21,6 +21,9 @@ pub struct WaylandApp {
     pub surface: Option<wl_surface::WlSurface>,
     pub layer_surface: Option<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1>,
     pub buffer: Option<wl_buffer::WlBuffer>,
+    // 使用双缓冲，避免每帧创建销毁 buffer
+    pub buffers: Vec<Option<wl_buffer::WlBuffer>>,
+    pub current_buffer_index: usize,
     pub shm_pool: Option<wl_shm_pool::WlShmPool>,
     pub shm_file: Option<File>,
     pub queue: Option<wayland_client::EventQueue<WaylandApp>>,
@@ -51,6 +54,8 @@ impl WaylandApp {
             surface: None,
             layer_surface: None,
             buffer: None,
+            buffers: vec![None, None], // 双缓冲
+            current_buffer_index: 0,
             shm_pool: None,
             shm_file: None,
             queue: None,
@@ -163,24 +168,28 @@ impl WaylandApp {
         shm_file.write_all(&frame_data)?;
         let file_time = file_start.elapsed();
 
-        // Destroy old buffer if exists
-        if let Some(old_buffer) = self.buffer.take() {
-            old_buffer.destroy();
-        }
-
-        // Create new buffer from existing pool
+        // 使用双缓冲：获取当前 buffer，如果不存在则创建
         let buffer_start = std::time::Instant::now();
-        let buffer = shm_pool.create_buffer(
-            0,
-            width as i32,
-            height as i32,
-            stride as i32,
-            wl_shm::Format::Argb8888,
-            &qh,
-            (),
-        );
-        self.buffer = Some(buffer.clone());
+        let buffer = if let Some(ref buf) = self.buffers[self.current_buffer_index] {
+            buf.clone()
+        } else {
+            // 创建新的 buffer
+            let new_buffer = shm_pool.create_buffer(
+                0,
+                width as i32,
+                height as i32,
+                stride as i32,
+                wl_shm::Format::Argb8888,
+                &qh,
+                (),
+            );
+            self.buffers[self.current_buffer_index] = Some(new_buffer.clone());
+            new_buffer
+        };
         let buffer_time = buffer_start.elapsed();
+
+        // 切换到下一个 buffer
+        self.current_buffer_index = (self.current_buffer_index + 1) % self.buffers.len();
 
         // Debug: log first few pixels (BGRA format) every 30 frames
         self.frame_count += 1;
@@ -202,7 +211,7 @@ impl WaylandApp {
         static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         if count % 30 == 0 {
-            log::info!("Render timing: file_write={:.2}ms, buffer_create={:.2}ms, commit={:.2}ms",
+            log::info!("Render timing: file_write={:.2}ms, buffer_get={:.2}ms, commit={:.2}ms",
                      file_time.as_secs_f64() * 1000.0,
                      buffer_time.as_secs_f64() * 1000.0,
                      commit_time.as_secs_f64() * 1000.0);
