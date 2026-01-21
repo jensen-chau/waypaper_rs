@@ -445,16 +445,22 @@ async fn decode_video_async(
                                     let sw_height = sw_frame.height();
                                     info!("Creating scaler for software frame: {}x{} format: {:?}", sw_width, sw_height, sw_format);
 
-                                    scaler = Some(Context::get(
-                                        sw_format,
-                                        sw_width,
-                                        sw_height,
-                                        ffmpeg::format::Pixel::BGRA,
-                                        output_width,
-                                        output_height,
-                                        Flags::FAST_BILINEAR, // 使用更快的算法
-                                    ).map_err(|e| anyhow::anyhow!("Failed to create scaler: {}", e))?);
-                                    first_frame_decoded = true;
+                                    // 如果尺寸相同，不创建缩放器
+                                    if sw_width == output_width && sw_height == output_height && sw_format == ffmpeg::format::Pixel::BGRA {
+                                        info!("No scaling needed, dimensions and format match");
+                                        first_frame_decoded = true;
+                                    } else {
+                                        scaler = Some(Context::get(
+                                            sw_format,
+                                            sw_width,
+                                            sw_height,
+                                            ffmpeg::format::Pixel::BGRA,
+                                            output_width,
+                                            output_height,
+                                            Flags::FAST_BILINEAR, // 使用更快的算法
+                                        ).map_err(|e| anyhow::anyhow!("Failed to create scaler: {}", e))?);
+                                        first_frame_decoded = true;
+                                    }
                                 }
 
                                 sw_frame
@@ -466,16 +472,22 @@ async fn decode_video_async(
                                     let sw_height = decoded.height();
                                     info!("Creating scaler for software frame: {}x{} format: {:?}", sw_width, sw_height, sw_format);
 
-                                    scaler = Some(Context::get(
-                                        sw_format,
-                                        sw_width,
-                                        sw_height,
-                                        ffmpeg::format::Pixel::BGRA,
-                                        output_width,
-                                        output_height,
-                                        Flags::FAST_BILINEAR, // 使用更快的算法
-                                    ).map_err(|e| anyhow::anyhow!("Failed to create scaler: {}", e))?);
-                                    first_frame_decoded = true;
+                                    // 如果尺寸相同，不创建缩放器
+                                    if sw_width == output_width && sw_height == output_height && sw_format == ffmpeg::format::Pixel::BGRA {
+                                        info!("No scaling needed, dimensions and format match");
+                                        first_frame_decoded = true;
+                                    } else {
+                                        scaler = Some(Context::get(
+                                            sw_format,
+                                            sw_width,
+                                            sw_height,
+                                            ffmpeg::format::Pixel::BGRA,
+                                            output_width,
+                                            output_height,
+                                            Flags::FAST_BILINEAR, // 使用更快的算法
+                                        ).map_err(|e| anyhow::anyhow!("Failed to create scaler: {}", e))?);
+                                        first_frame_decoded = true;
+                                    }
                                 }
                                 decoded
                             };
@@ -486,7 +498,7 @@ async fn decode_video_async(
                                 scaler.run(&bgra_frame, &mut final_bgra_frame)
                                     .map_err(|e| anyhow::anyhow!("Failed to scale frame: {}", e))?;
                             } else {
-                                // No scaler yet, use as-is
+                                // No scaler needed, use as-is
                                 final_bgra_frame = bgra_frame;
                             }
 
@@ -632,8 +644,10 @@ async fn render_frames_async(
                     wayland_app.render_frame(&frame_data.frame, frame_data.width, frame_data.height)
                 {
                     error!("Failed to render frame: {}", e);
-                } else {
-                    // 只在成功渲染后才 dispatch
+                }
+
+                // 只在每 5 帧才 dispatch 一次，减少 CPU 占用
+                if frame_count % 5 == 0 {
                     if let Err(e) = wayland_app.dispatch_events() {
                         error!("Failed to dispatch Wayland events: {}", e);
                     }
