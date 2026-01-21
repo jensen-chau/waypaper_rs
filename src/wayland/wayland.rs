@@ -224,9 +224,9 @@ impl WaylandApp {
         if self.queue.is_some() {
             // Take the queue temporarily to avoid borrow issues
             let mut queue = self.queue.take().unwrap();
-            // 使用 dispatch_pending 而不是 roundtrip，避免阻塞等待
-            // 只处理已有的事件，不等待新事件
-            let result = queue.dispatch_pending(self);
+            // 使用 roundtrip 确保所有事件都被正确处理
+            // 虽然 roundtrip 会阻塞，但能保证渲染同步，避免跳帧
+            let result = queue.roundtrip(self);
             self.queue = Some(queue);
             result.map_err(|e| anyhow::anyhow!("Failed to dispatch events: {}", e))?;
         }
