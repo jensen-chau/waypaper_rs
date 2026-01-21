@@ -271,6 +271,47 @@ impl HardwareDecoder {
                 return Err(anyhow::anyhow!("Failed to create scale_vaapi filter: {}", ret));
             }
 
+            // 创建 hwdownload filter (将硬件帧下载到软件帧)
+            let hwdownload = ffmpeg::ffi::avfilter_get_by_name(b"hwdownload\0".as_ptr() as *const i8);
+            if hwdownload.is_null() {
+                return Err(anyhow::anyhow!("Failed to find hwdownload filter"));
+            }
+
+            let mut hwdownload_ctx: *mut ffmpeg::ffi::AVFilterContext = std::ptr::null_mut();
+            let ret = ffmpeg::ffi::avfilter_graph_create_filter(
+                &mut hwdownload_ctx,
+                hwdownload,
+                b"download\0".as_ptr() as *const i8,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                graph_ptr,
+            );
+            if ret < 0 {
+                return Err(anyhow::anyhow!("Failed to create hwdownload filter: {}", ret));
+            }
+
+            // 创建 format filter (转换为 BGRA)
+            let format = ffmpeg::ffi::avfilter_get_by_name(b"format\0".as_ptr() as *const i8);
+            if format.is_null() {
+                return Err(anyhow::anyhow!("Failed to find format filter"));
+            }
+
+            let mut format_ctx: *mut ffmpeg::ffi::AVFilterContext = std::ptr::null_mut();
+            let format_args = "pix_fmts=bgra";
+            let format_args_cstr = std::ffi::CString::new(format_args).unwrap();
+            
+            let ret = ffmpeg::ffi::avfilter_graph_create_filter(
+                &mut format_ctx,
+                format,
+                b"format\0".as_ptr() as *const i8,
+                format_args_cstr.as_ptr(),
+                std::ptr::null_mut(),
+                graph_ptr,
+            );
+            if ret < 0 {
+                return Err(anyhow::anyhow!("Failed to create format filter: {}", ret));
+            }
+
             // 创建 buffersink filter (输出)
             let buffersink = ffmpeg::ffi::avfilter_get_by_name(b"buffersink\0".as_ptr() as *const i8);
             if buffersink.is_null() {
@@ -290,15 +331,25 @@ impl HardwareDecoder {
                 return Err(anyhow::anyhow!("Failed to create buffersink filter: {}", ret));
             }
 
-            // 连接 filters
+            // 连接 filters: buffer_src -> scale_vaapi -> hwdownload -> format -> buffersink
             let ret = ffmpeg::ffi::avfilter_link(buffer_src_ctx, 0, scale_ctx, 0);
             if ret < 0 {
                 return Err(anyhow::anyhow!("Failed to link buffer_src to scale_vaapi: {}", ret));
             }
 
-            let ret = ffmpeg::ffi::avfilter_link(scale_ctx, 0, buffersink_ctx, 0);
+            let ret = ffmpeg::ffi::avfilter_link(scale_ctx, 0, hwdownload_ctx, 0);
             if ret < 0 {
-                return Err(anyhow::anyhow!("Failed to link scale_vaapi to buffersink: {}", ret));
+                return Err(anyhow::anyhow!("Failed to link scale_vaapi to hwdownload: {}", ret));
+            }
+
+            let ret = ffmpeg::ffi::avfilter_link(hwdownload_ctx, 0, format_ctx, 0);
+            if ret < 0 {
+                return Err(anyhow::anyhow!("Failed to link hwdownload to format: {}", ret));
+            }
+
+            let ret = ffmpeg::ffi::avfilter_link(format_ctx, 0, buffersink_ctx, 0);
+            if ret < 0 {
+                return Err(anyhow::anyhow!("Failed to link format to buffersink: {}", ret));
             }
 
             // 配置 filter graph
@@ -577,10 +628,8 @@ async fn decode_video_async(
                                     let mut hw_scaled_frame = Video::empty();
                                     match hw_decoder.scale_frame_gpu(&decoded, &mut hw_scaled_frame, output_width as i32, output_height as i32) {
                                         Ok(_) => {
-                                            // 硬件缩放成功，传输到软件帧
-                                            let mut sw_frame = Video::empty();
-                                            hw_decoder.transfer_frame(&hw_scaled_frame, &mut sw_frame)?;
-                                            sw_frame
+                                            // 硬件缩放成功，直接使用（已经是 BGRA 软件帧）
+                                            hw_scaled_frame
                                         }
                                         Err(e) => {
                                             // 硬件缩放失败，回退到软件缩放
