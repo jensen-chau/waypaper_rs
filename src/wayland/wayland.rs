@@ -244,16 +244,8 @@ impl WaylandApp {
         let commit_start = std::time::Instant::now();
         surface.attach(Some(&buffer), 0, 0);
         
-        // 如果支持 viewporter，使用它来设置源和目标矩形
-        if let Some(ref viewport) = self.viewport {
-            // 设置源矩形（整个视频帧）
-            viewport.set_source(0.0, 0.0, width as f64, height as f64);
-            // 设置目标矩形（整个屏幕）
-            viewport.set_destination(self.output_width as i32, self.output_height as i32);
-        } else {
-            // 回退到传统的缩放方式
-            surface.set_buffer_scale(1);
-        }
+        // 不使用 viewporter，直接使用 surface
+        surface.set_buffer_scale(1);
         
         surface.damage(0, 0, width as i32, height as i32);
         surface.commit();
