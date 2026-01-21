@@ -12,25 +12,6 @@ use wayland_client::{
 };
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
-/// Scaling mode for wallpaper/video
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScaleMode {
-    /// Crop mode (cover): Scale to fill the entire output, cropping excess
-    /// This is the default wallpaper behavior
-    Crop,
-    /// Fit mode (contain): Scale to fit within output, preserving aspect ratio
-    /// May have black bars
-    Fit,
-    /// No scaling: Display at original size, centered
-    No,
-}
-
-impl Default for ScaleMode {
-    fn default() -> Self {
-        ScaleMode::Crop
-    }
-}
-
 pub struct WaylandApp {
     pub conn: Connection,
     pub display: wl_display::WlDisplay,
@@ -50,7 +31,6 @@ pub struct WaylandApp {
     pub pool_size: i32,
     pub output_width: u32,
     pub output_height: u32,
-    pub scale_mode: ScaleMode,
 }
 
 impl WaylandApp {
@@ -81,7 +61,6 @@ impl WaylandApp {
             pool_size,
             output_width: 1920, // Default to 1920x1080
             output_height: 1080,
-            scale_mode: ScaleMode::default(),
         };
         
         // Create event queue
@@ -166,22 +145,12 @@ impl WaylandApp {
             .ok_or_else(|| anyhow::anyhow!("Surface not available"))?;
         let shm_pool = self.shm_pool.as_ref().ok_or_else(|| anyhow::anyhow!("SHM pool not available"))?;
 
-        // Check if scaling is needed (before any mutable borrows)
-        let (render_data, render_width, render_height) = if width != self.output_width || height != self.output_height {
-            if self.frame_count == 0 {
-                log::info!("Scaling video from {}x{} to output {}x{}", width, height, self.output_width, self.output_height);
-            }
-            self.scale_frame_to_output(frame_data, width, height)
-        } else {
-            (frame_data.to_vec(), width, height)
-        };
-
         let shm_file = self.shm_file.as_mut().ok_or_else(|| anyhow::anyhow!("SHM file not available"))?;
         let queue = self.queue.as_mut().ok_or_else(|| anyhow::anyhow!("Queue not available"))?;
         let qh = queue.handle();
 
-        let stride = render_width * 4;
-        let size = stride * render_height;
+        let stride = width * 4;
+        let size = stride * height;
 
         // Check if pool size is sufficient
         if size as i32 > self.pool_size {
@@ -191,7 +160,7 @@ impl WaylandApp {
         // Write frame data to SHM file
         let file_start = std::time::Instant::now();
         shm_file.seek(std::io::SeekFrom::Start(0))?;
-        shm_file.write_all(&render_data)?;
+        shm_file.write_all(&frame_data)?;
         let file_time = file_start.elapsed();
 
         // Destroy old buffer if exists
@@ -203,8 +172,8 @@ impl WaylandApp {
         let buffer_start = std::time::Instant::now();
         let buffer = shm_pool.create_buffer(
             0,
-            render_width as i32,
-            render_height as i32,
+            width as i32,
+            height as i32,
             stride as i32,
             wl_shm::Format::Argb8888,
             &qh,
@@ -216,15 +185,16 @@ impl WaylandApp {
         // Debug: log first few pixels (BGRA format) every 30 frames
         self.frame_count += 1;
         if self.frame_count % 30 == 0 {
-            log::info!("Frame {} - First 2 pixels (BGRA): B={}, G={}, R={}, A={}, B={}, G={}, R={}, A={}",
-                     self.frame_count, render_data[0], render_data[1], render_data[2], render_data[3],
-                     render_data[4], render_data[5], render_data[6], render_data[7]);
+            log::info!("Frame {} - {}x{} - First 2 pixels (BGRA): B={}, G={}, R={}, A={}, B={}, G={}, R={}, A={}",
+                     self.frame_count, width, height,
+                     frame_data[0], frame_data[1], frame_data[2], frame_data[3],
+                     frame_data[4], frame_data[5], frame_data[6], frame_data[7]);
         }
 
         // Attach and commit
         let commit_start = std::time::Instant::now();
         surface.attach(Some(&buffer), 0, 0);
-        surface.damage(0, 0, render_width as i32, render_height as i32);
+        surface.damage(0, 0, width as i32, height as i32);
         surface.commit();
         let commit_time = commit_start.elapsed();
 
@@ -250,194 +220,6 @@ impl WaylandApp {
             result.map_err(|e| anyhow::anyhow!("Failed to dispatch events: {}", e))?;
         }
         Ok(())
-    }
-
-    pub fn set_scale_mode(&mut self, mode: ScaleMode) {
-        log::info!("Setting scale mode to: {:?}", mode);
-        self.scale_mode = mode;
-    }
-
-    /// Scale frame according to the configured scale mode
-    pub fn scale_frame_to_output(
-        &self,
-        frame_data: &[u8],
-        video_width: u32,
-        video_height: u32,
-    ) -> (Vec<u8>, u32, u32) {
-        match self.scale_mode {
-            ScaleMode::Crop => self.scale_crop(frame_data, video_width, video_height),
-            ScaleMode::Fit => self.scale_fit(frame_data, video_width, video_height),
-            ScaleMode::No => self.scale_no(frame_data, video_width, video_height),
-        }
-    }
-
-    /// Crop mode (cover): Scale to fill the entire output, cropping excess
-    /// This is the default wallpaper behavior
-    fn scale_crop(
-        &self,
-        frame_data: &[u8],
-        video_width: u32,
-        video_height: u32,
-    ) -> (Vec<u8>, u32, u32) {
-        let output_width = self.output_width;
-        let output_height = self.output_height;
-
-        // Calculate scaling factors
-        let scale_x = output_width as f64 / video_width as f64;
-        let scale_y = output_height as f64 / video_height as f64;
-        
-        // Use the LARGER scale to cover the entire output (crop mode)
-        // This ensures the output is completely filled
-        let scale = scale_x.max(scale_y);
-        
-        let scaled_width = (video_width as f64 * scale) as u32;
-        let scaled_height = (video_height as f64 * scale) as u32;
-        
-        // Calculate source crop offsets to center the content
-        let src_offset_x_f64 = (scaled_width - output_width) as f64 / 2.0;
-        let src_offset_y_f64 = (scaled_height - output_height) as f64 / 2.0;
-        
-        // Create output buffer
-        let mut output_data = vec![0u8; (output_width * output_height * 4) as usize];
-        
-        // Perform scaling with nearest neighbor (fastest)
-        let video_stride = video_width * 4;
-        let output_stride = output_width * 4;
-        let inv_scale = 1.0 / scale;
-        
-        unsafe {
-            let src_ptr = frame_data.as_ptr();
-            let dst_ptr = output_data.as_mut_ptr();
-            
-            for y in 0..output_height {
-                // Pre-calculate source Y coordinate
-                let src_y = ((y as f64 + src_offset_y_f64) * inv_scale) as u32;
-                let src_row_start = (src_y as usize) * video_stride as usize;
-                let dst_row_start = (y as usize) * output_stride as usize;
-                
-                for x in 0..output_width {
-                    // Pre-calculate source X coordinate
-                    let src_x = ((x as f64 + src_offset_x_f64) * inv_scale) as u32;
-                    let src_idx = src_row_start + (src_x as usize * 4);
-                    let dst_idx = dst_row_start + (x as usize * 4);
-                    
-                    // Copy BGRA pixels
-                    *dst_ptr.add(dst_idx) = *src_ptr.add(src_idx);         // B
-                    *dst_ptr.add(dst_idx + 1) = *src_ptr.add(src_idx + 1); // G
-                    *dst_ptr.add(dst_idx + 2) = *src_ptr.add(src_idx + 2); // R
-                    *dst_ptr.add(dst_idx + 3) = *src_ptr.add(src_idx + 3); // A
-                }
-            }
-        }
-        
-        (output_data, output_width, output_height)
-    }
-
-    /// Fit mode (contain): Scale to fit within output, preserving aspect ratio
-    /// May have black bars
-    fn scale_fit(
-        &self,
-        frame_data: &[u8],
-        video_width: u32,
-        video_height: u32,
-    ) -> (Vec<u8>, u32, u32) {
-        let output_width = self.output_width;
-        let output_height = self.output_height;
-
-        // Calculate scaling factors
-        let scale_x = output_width as f64 / video_width as f64;
-        let scale_y = output_height as f64 / video_height as f64;
-        
-        // Use the smaller scale to preserve aspect ratio
-        let scale = scale_x.min(scale_y);
-        
-        let scaled_width = (video_width as f64 * scale) as u32;
-        let scaled_height = (video_height as f64 * scale) as u32;
-        
-        // Center the scaled image
-        let offset_x = ((output_width - scaled_width) / 2) as u32;
-        let offset_y = ((output_height - scaled_height) / 2) as u32;
-        
-        // Create output buffer (fill with black)
-        let mut output_data = vec![0u8; (output_width * output_height * 4) as usize];
-        
-        // Perform scaling with nearest neighbor (fastest)
-        let video_stride = video_width * 4;
-        let output_stride = output_width * 4;
-        let inv_scale = 1.0 / scale;
-        
-        unsafe {
-            let src_ptr = frame_data.as_ptr();
-            let dst_ptr = output_data.as_mut_ptr();
-            
-            for y in 0..scaled_height {
-                let src_y = (y as f64 * inv_scale) as u32;
-                let src_row_start = (src_y as usize) * video_stride as usize;
-                let dst_row_start = ((offset_y + y) as usize) * output_stride as usize;
-                
-                for x in 0..scaled_width {
-                    let src_x = (x as f64 * inv_scale) as u32;
-                    let src_idx = src_row_start + (src_x as usize * 4);
-                    let dst_idx = dst_row_start + ((offset_x + x) as usize * 4);
-                    
-                    // Copy BGRA pixels
-                    *dst_ptr.add(dst_idx) = *src_ptr.add(src_idx);         // B
-                    *dst_ptr.add(dst_idx + 1) = *src_ptr.add(src_idx + 1); // G
-                    *dst_ptr.add(dst_idx + 2) = *src_ptr.add(src_idx + 2); // R
-                    *dst_ptr.add(dst_idx + 3) = *src_ptr.add(src_idx + 3); // A
-                }
-            }
-        }
-        
-        (output_data, output_width, output_height)
-    }
-
-    /// No scaling: Display at original size, centered
-    fn scale_no(
-        &self,
-        frame_data: &[u8],
-        video_width: u32,
-        video_height: u32,
-    ) -> (Vec<u8>, u32, u32) {
-        let output_width = self.output_width;
-        let output_height = self.output_height;
-
-        // Center the image
-        let offset_x = ((output_width - video_width) / 2).max(0) as u32;
-        let offset_y = ((output_height - video_height) / 2).max(0) as u32;
-        
-        // Calculate actual dimensions to copy (don't exceed output)
-        let copy_width = video_width.min(output_width);
-        let copy_height = video_height.min(output_height);
-        
-        // Create output buffer (fill with black)
-        let mut output_data = vec![0u8; (output_width * output_height * 4) as usize];
-        
-        let video_stride = video_width * 4;
-        let output_stride = output_width * 4;
-        
-        unsafe {
-            let src_ptr = frame_data.as_ptr();
-            let dst_ptr = output_data.as_mut_ptr();
-            
-            for y in 0..copy_height {
-                let src_row_start = (y as usize) * video_stride as usize;
-                let dst_row_start = ((offset_y + y) as usize) * output_stride as usize;
-                
-                for x in 0..copy_width {
-                    let src_idx = src_row_start + (x as usize * 4);
-                    let dst_idx = dst_row_start + ((offset_x + x) as usize * 4);
-                    
-                    // Copy BGRA pixels
-                    *dst_ptr.add(dst_idx) = *src_ptr.add(src_idx);         // B
-                    *dst_ptr.add(dst_idx + 1) = *src_ptr.add(src_idx + 1); // G
-                    *dst_ptr.add(dst_idx + 2) = *src_ptr.add(src_idx + 2); // R
-                    *dst_ptr.add(dst_idx + 3) = *src_ptr.add(src_idx + 3); // A
-                }
-            }
-        }
-        
-        (output_data, output_width, output_height)
     }
 }
 

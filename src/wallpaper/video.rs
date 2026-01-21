@@ -1,13 +1,18 @@
+use log::{error, info, warn};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use log::{info, error, warn};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::wallpaper::{project, WallpaperType};
 use crate::wallpaper::Wallpaper;
+use crate::wallpaper::{WallpaperType, project};
 use anyhow::Result;
+use ffmpeg_next as ffmpeg;
 
+use ffmpeg::format::input;
+use ffmpeg::media::Type;
+use ffmpeg::software::scaling::{context::Context, flag::Flags};
+use ffmpeg::util::frame::video::Video;
 pub struct VideoWallpaper {
     video_path: String,
     is_paused: Arc<Mutex<bool>>,
@@ -15,7 +20,7 @@ pub struct VideoWallpaper {
     decode_task: Option<JoinHandle<()>>,
     render_task: Option<JoinHandle<()>>,
     project: Option<project::Project>,
-    wallpaper_type: WallpaperType
+    wallpaper_type: WallpaperType,
 }
 
 pub struct FrameData {
@@ -37,7 +42,7 @@ impl VideoWallpaper {
             wallpaper_type,
         }
     }
-    
+
     pub fn stop(&mut self) {
         // Note: This is a synchronous method, so we can't use async here
         // The actual stopping will be handled by the async tasks checking the flag
@@ -52,7 +57,7 @@ impl Wallpaper for VideoWallpaper {
         // Will need to be handled differently in async context
         info!("VideoWallpaper play requested");
     }
-    
+
     fn pause(&mut self) {
         // Note: This is a synchronous method, can't set async mutex here
         // Will need to be handled differently in async context
@@ -64,14 +69,14 @@ impl Wallpaper for VideoWallpaper {
         let video_path = self.video_path.clone();
         let is_paused = self.is_paused.clone();
         let is_stopped = self.is_stopped.clone();
-        
+
         // Clone for render task
         let is_paused_render = is_paused.clone();
         let is_stopped_render = is_stopped.clone();
-        
+
         // Get tokio runtime handle
         let handle = tokio::runtime::Handle::current();
-        
+
         // Spawn decode task
         let decode_task = handle.spawn(async move {
             if let Err(e) = decode_video_async(&video_path, tx, is_paused, is_stopped).await {
@@ -79,7 +84,7 @@ impl Wallpaper for VideoWallpaper {
             }
         });
         self.decode_task = Some(decode_task);
-        
+
         // Spawn render task
         let render_task = handle.spawn(async move {
             render_frames_async(rx, is_paused_render, is_stopped_render).await;
@@ -87,9 +92,7 @@ impl Wallpaper for VideoWallpaper {
         self.render_task = Some(render_task);
     }
 
-    fn info(&self) {
-        
-    }
+    fn info(&self) {}
 }
 
 async fn decode_video_async(
@@ -98,198 +101,224 @@ async fn decode_video_async(
     is_paused: Arc<Mutex<bool>>,
     is_stopped: Arc<Mutex<bool>>,
 ) -> Result<()> {
-    use video_rs::{Decoder, DecoderBuilder};
-    use video_rs::hwaccel::HardwareAccelerationDeviceType;
+    info!("decode_video_async started");
+    let video_path = video_path.to_string();
+    let output_width = 1920u32;
+    let output_height = 1080u32;
 
-    info!("Opening video: {}", video_path);
-
-    // Check available hardware acceleration
-    let available_hw = HardwareAccelerationDeviceType::list_available();
-    info!("Available hardware acceleration devices: {:?}", available_hw);
-
-    // Create decoder with hardware acceleration
-    let decoder = if available_hw.contains(&HardwareAccelerationDeviceType::VaApi) {
-        info!("Using VA-API hardware acceleration (Intel/AMD GPU)");
-        DecoderBuilder::new(std::path::Path::new(video_path))
-            .with_hardware_acceleration(HardwareAccelerationDeviceType::VaApi)
-            .build()
-    } else if available_hw.contains(&HardwareAccelerationDeviceType::Cuda) {
-        info!("Using CUDA hardware acceleration (NVIDIA GPU)");
-        DecoderBuilder::new(std::path::Path::new(video_path))
-            .with_hardware_acceleration(HardwareAccelerationDeviceType::Cuda)
-            .build()
-    } else if available_hw.contains(&HardwareAccelerationDeviceType::VideoToolbox) {
-        info!("Using VideoToolbox hardware acceleration (Apple)");
-        DecoderBuilder::new(std::path::Path::new(video_path))
-            .with_hardware_acceleration(HardwareAccelerationDeviceType::VideoToolbox)
-            .build()
-    } else {
-        info!("No hardware acceleration available, using software decoding");
-        Decoder::new(std::path::Path::new(video_path))
-    };
-
-    let decoder = decoder.map_err(|e| anyhow::anyhow!("Failed to create decoder: {}", e))?;
-    let decoder_arc = Arc::new(Mutex::new(decoder));
-
-    info!("Video opened successfully");
-
-    let mut frame_count = 0u64;
-    let mut last_pts: Option<f64> = None;
-    let mut frame_time_ms: u32 = 33; // Default to ~30fps
-    let mut total_decode_time = Duration::from_secs(0);
-    let mut total_convert_time = Duration::from_secs(0);
-
-    loop {
-        // Check stop flag every frame (critical for shutdown)
-        if *is_stopped.lock().await {
-            info!("Decode thread stopped");
-            break;
-        }
+    // Run all ffmpeg operations in a blocking thread
+    tokio::task::spawn_blocking::<_, Result<()>>(move || {
 
 
+        info!("spawn_blocking thread started");
 
-        // Only check pause flag every 10 frames to reduce lock contention
-        if frame_count % 10 == 0 && *is_paused.lock().await {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            continue;
-        }
+        // Initialize ffmpeg
+        info!("Initializing ffmpeg...");
+        ffmpeg::init().map_err(|e| anyhow::anyhow!("Failed to initialize ffmpeg: {}", e))?;
+        info!("ffmpeg initialized successfully");
 
-        // Decode with timeout to prevent permanent blocking
-        let decode_start = Instant::now();
-        let decode_result = tokio::time::timeout(
-            Duration::from_secs(5), // 5 second timeout
-            async {
-                let mut decoder_guard = decoder_arc.lock().await;
-                decoder_guard.decode()
-            }
-        ).await;
+        info!("Opening video: {}", video_path);
 
-        match decode_result {
-            Ok(Ok((timestamp, frame_data))) => {
-                let decode_time = decode_start.elapsed();
-                total_decode_time += decode_time;
-                frame_count += 1;
+        // Open input file
+        let mut ictx = input(&video_path)
+            .map_err(|e| anyhow::anyhow!("Failed to open video file: {}", e))?;
+        info!("Video file opened successfully");
 
-                // Get frame dimensions from the frame data itself
-                let shape = frame_data.shape();
-                let height = shape[0] as u32;
-                let width = shape[1] as u32;
+        // Find best video stream
+        let input_stream = ictx
+            .streams()
+            .best(Type::Video)
+            .ok_or_else(|| anyhow::anyhow!("No video stream found"))?;
+        let video_stream_index = input_stream.index();
+        info!("Found video stream at index {}", video_stream_index);
 
-                // Debug: log pixel format and first few pixels (RGB format)
-                if frame_count % 60 == 0 {
-                    let frame_slice = frame_data.as_slice().unwrap();
-                    info!("Frame {} - {}x{} - First 3 pixels (RGB): R={}, G={}, B={}, R={}, G={}, B={}",
-                          frame_count, width, height,
-                          frame_slice[0], frame_slice[1], frame_slice[2],
-                          frame_slice[3], frame_slice[4], frame_slice[5]);
+        // Get stream time base for timestamp conversion
+        let time_base = input_stream.time_base();
+        info!("Stream time base: {}/{}", time_base.numerator(), time_base.denominator());
+
+// Create decoder
+        let context_decoder = ffmpeg::codec::context::Context::from_parameters(input_stream.parameters())
+            .map_err(|e| anyhow::anyhow!("Failed to create decoder context: {}", e))?;
+        let mut decoder = context_decoder.decoder().video()
+            .map_err(|e| anyhow::anyhow!("Failed to create video decoder: {}", e))?;
+
+        info!("Decoder created successfully");
+
+        info!("Video opened: {}x{} -> {}x{} (BGRA)",
+              decoder.width(), decoder.height(), output_width, output_height);
+
+        let mut frame_count = 0u64;
+        let mut last_pts: Option<i64> = None;
+        let mut frame_time_ms: u32 = 33; // Default to ~30fps
+
+        // Create runtime for async operations
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| anyhow::anyhow!("Failed to create runtime: {}", e))?;
+
+        let result = rt.block_on(async move {
+            let mut decoder = decoder;
+
+            info!("Starting decode loop...");
+            let mut packet_count = 0u64;
+
+            // Create reusable scaler
+            let mut scaler = Context::get(
+                decoder.format(),
+                decoder.width(),
+                decoder.height(),
+                ffmpeg::format::Pixel::BGRA,
+                output_width,
+                output_height,
+                Flags::BILINEAR,
+            ).map_err(|e| anyhow::anyhow!("Failed to create scaler: {}", e))?;
+            info!("Scaler created successfully");
+
+            loop {
+                // Check stop flag every frame (critical for shutdown)
+                if *is_stopped.lock().await {
+                    info!("Decode thread stopped");
+                    break Ok(());
                 }
 
-                // Convert frame to BGRA
-                let convert_start = std::time::Instant::now();
-                let rgba_data = convert_frame_to_rgba(&frame_data, width, height)?;
-                let convert_time = convert_start.elapsed();
-                total_convert_time += convert_time;
+                // Only check pause flag every 10 frames to reduce lock contention
+                if frame_count % 10 == 0 && *is_paused.lock().await {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
 
-                // Calculate frame time based on timestamp
-                let pts = timestamp.as_secs_f64();
-
-                // Calculate frame time from PTS difference
-                if let Some(last) = last_pts {
-                    let pts_diff = pts - last;
-                    let time_ms = (pts_diff * 1000.0) as u32;
-                    // Update frame time if it's reasonable (between 1ms and 1000ms)
-                    if time_ms > 0 && time_ms < 1000 {
-                        frame_time_ms = time_ms;
+                // Read next packet
+                let (stream, packet) = match ictx.packets().next() {
+                    Some((s, p)) => (s, p),
+                    None => {
+                        // End of stream, loop back
+                        info!("Video ended, seeking to beginning");
+                        let _ = ictx.seek(0, ..);
+                        frame_count = 0;
+                        last_pts = None;
+                        frame_time_ms = 33;
+                        continue;
                     }
-                }
-                last_pts = Some(pts);
-
-                // Send frame data
-                let frame_data = FrameData {
-                    frame: rgba_data,
-                    width,
-                    height,
-                    frame_time: frame_time_ms,
                 };
 
-                match tx.send(frame_data).await {
-                    Ok(_) => {}
-                    Err(_) => {
-                        warn!("Render thread disconnected");
-                        break;
+                packet_count += 1;
+                if packet_count % 100 == 0 {
+                    info!("Processed {} packets", packet_count);
+                }
+
+                if stream.index() == video_stream_index {
+                    // Send packet to decoder
+                    if let Err(e) = decoder.send_packet(&packet) {
+                        error!("Failed to send packet to decoder: {}", e);
+                        break Err(anyhow::anyhow!("Decoder error"));
+                    }
+
+                    // Receive decoded frames
+                    let mut decoded = Video::empty();
+                    match decoder.receive_frame(&mut decoded) {
+                        Ok(_) => {
+                            let pts = match decoded.pts() {
+                                Some(p) => p,
+                                None => continue,
+                            };
+
+                            frame_count += 1;
+
+                            if frame_count == 1 {
+                                info!("Successfully decoded first frame");
+                            }
+
+                            // Scale and convert frame to BGRA (reuse scaler)
+                            let mut bgra_frame = Video::empty();
+                            scaler.run(&decoded, &mut bgra_frame)
+                                .map_err(|e| anyhow::anyhow!("Failed to scale frame: {}", e))?;
+
+                            let frame_data = extract_frame_data(&bgra_frame, output_width, output_height)?;
+
+                            // Debug: log first few pixels (BGRA format)
+                            if frame_count % 60 == 0 {
+                                info!("Frame {} - {}x{} - First 2 pixels (BGRA): B={}, G={}, R={}, A={}, B={}, G={}, R={}, A={}",
+                                      frame_count, output_width, output_height,
+                                      frame_data[0], frame_data[1], frame_data[2], frame_data[3],
+                                      frame_data[4], frame_data[5], frame_data[6], frame_data[7]);
+                            }
+
+                            // Calculate frame time from PTS difference
+                            if let Some(last) = last_pts {
+                                let pts_diff = (pts - last) as f64;
+                                let time_ms = (pts_diff * time_base.numerator() as f64 / time_base.denominator() as f64 * 1000.0) as u32;
+                                if time_ms > 0 && time_ms < 1000 {
+                                    frame_time_ms = time_ms;
+                                }
+                            }
+                            last_pts = Some(pts);
+
+                            // Send frame data
+                            let frame_data = FrameData {
+                                frame: frame_data,
+                                width: output_width,
+                                height: output_height,
+                                frame_time: frame_time_ms,
+                            };
+
+                            if tx.send(frame_data).await.is_err() {
+                                warn!("Render thread disconnected");
+                                break Err(anyhow::anyhow!("Render thread disconnected"));
+                            }
+
+                            if frame_count % 60 == 0 {
+                                info!("Decoded {} frames, frame time: {}ms", frame_count, frame_time_ms);
+                            }
+                        }
+                        Err(ffmpeg::Error::Eof) | Err(ffmpeg::Error::Other { errno: 11, .. }) => {
+                            // No frame available, continue
+                        }
+                        Err(e) => {
+                            error!("Failed to receive frame: {}", e);
+                            break Err(anyhow::anyhow!("Failed to receive frame: {}", e));
+                        }
                     }
                 }
+            }
+        });
 
-                if frame_count % 60 == 0 {
-                    let avg_decode = total_decode_time.as_secs_f64() * 1000.0 / 60.0;
-                    let avg_convert = total_convert_time.as_secs_f64() * 1000.0 / 60.0;
-                    info!("Decoded {} frames, frame time: {}ms, avg_decode={:.2}ms, avg_convert={:.2}ms",
-                          frame_count, frame_time_ms, avg_decode, avg_convert);
-                    total_decode_time = Duration::from_secs(0);
-                    total_convert_time = Duration::from_secs(0);
-                }
-            }
-            Ok(Err(e)) => {
-                let error_msg = e.to_string().to_lowercase();
-                if error_msg.contains("end") || error_msg.contains("eof") || error_msg.contains("exhausted") {
-                    // End of video, loop back using seek(0)
-                    info!("Video ended, seeking to beginning");
-                    let mut decoder_guard = decoder_arc.lock().await;
-                    let _ = decoder_guard.seek(0);
-                    
-                    // Reset frame tracking
-                    frame_count = 0;
-                    last_pts = None;
-                    frame_time_ms = 33;
-                } else {
-                    error!("Decode error: {}", e);
-                    break;
-                }
-            }
-            Err(_) => {
-                // Timeout
-                error!("Decode timeout after 5 seconds");
-                break;
-            }
-        }
-    }
-
-    Ok(())
+        result
+    }).await.map_err(|e| anyhow::anyhow!("Spawn blocking task failed: {}", e))?
 }
 
-
-fn convert_frame_to_rgba(
-    frame_data: &ndarray::ArrayBase<ndarray::OwnedRepr<u8>, ndarray::Dim<[usize; 3]>>,
+/// Extract frame data from Video frame
+fn extract_frame_data(
+    frame: &ffmpeg::util::frame::video::Video,
     width: u32,
     height: u32,
 ) -> Result<Vec<u8>> {
-    // frame_data is expected to be in RGB format (height, width, 3)
-    // Wayland uses BGRA format, so we need to convert RGB -> BGRA
-    // Note: Wayland expects BGRA, not RGBA
-    
-    let pixel_count = (width * height) as usize;
-    let mut bgra_data = vec![0u8; pixel_count * 4];
-    
-    let frame_data_slice = frame_data.as_slice().unwrap();
-    
-    // Use unsafe pointer arithmetic for maximum performance
-    // RGB24 -> BGRA: R->B, G->G, B->R
+    let stride = frame.stride(0);
+    let data = frame.data(0);
+
+    let width = width as usize;
+    let height = height as usize;
+    let mut frame_data = vec![0u8; width * height * 4];
+
     unsafe {
-        let rgb_ptr = frame_data_slice.as_ptr();
-        let bgra_ptr = bgra_data.as_mut_ptr();
-        
-        for i in 0..pixel_count {
-            let rgb_idx = i * 3;
-            let bgra_idx = i * 4;
-            
-            *bgra_ptr.add(bgra_idx) = *rgb_ptr.add(rgb_idx + 2);     // B <- R
-            *bgra_ptr.add(bgra_idx + 1) = *rgb_ptr.add(rgb_idx + 1); // G <- G
-            *bgra_ptr.add(bgra_idx + 2) = *rgb_ptr.add(rgb_idx);     // R <- B
-            *bgra_ptr.add(bgra_idx + 3) = 255;                        // A (fully opaque)
+        let src_ptr = data.as_ptr();
+        let dst_ptr = frame_data.as_mut_ptr();
+
+        for y in 0..height {
+            let src_row_start = y * stride;
+            let dst_row_start = y * width * 4;
+
+            for x in 0..width {
+                let src_idx = src_row_start + x * 4;
+                let dst_idx = dst_row_start + x * 4;
+
+                *dst_ptr.add(dst_idx) = *src_ptr.add(src_idx); // B
+                *dst_ptr.add(dst_idx + 1) = *src_ptr.add(src_idx + 1); // G
+                *dst_ptr.add(dst_idx + 2) = *src_ptr.add(src_idx + 2); // R
+                *dst_ptr.add(dst_idx + 3) = *src_ptr.add(src_idx + 3); // A
+            }
         }
     }
-    
-    Ok(bgra_data)
+
+    Ok(frame_data)
 }
 
 async fn render_frames_async(
@@ -340,7 +369,11 @@ async fn render_frames_async(
                 if let Some(last) = last_frame_time {
                     let gap = last.elapsed();
                     if gap.as_millis() > 50 {
-                        warn!("Frame receive gap: {:.2}ms (frame {})", gap.as_secs_f64() * 1000.0, frame_count);
+                        warn!(
+                            "Frame receive gap: {:.2}ms (frame {})",
+                            gap.as_secs_f64() * 1000.0,
+                            frame_count
+                        );
                     }
                 }
                 last_frame_time = Some(std::time::Instant::now());
@@ -348,7 +381,10 @@ async fn render_frames_async(
                 // Check if this is a loop restart (frame_time reset to default 33ms)
                 if frame_data.frame_time == 33 && frame_count > 100 {
                     // This might be a loop restart, reset timing
-                    info!("Possible loop restart detected at frame {}, resetting timing", frame_count);
+                    info!(
+                        "Possible loop restart detected at frame {}, resetting timing",
+                        frame_count
+                    );
                     first_frame_time = Some(std::time::Instant::now());
                     next_frame_time = std::time::Instant::now();
                 }
@@ -364,7 +400,9 @@ async fn render_frames_async(
                 let render_start = std::time::Instant::now();
 
                 // Render frame to Wayland surface
-                if let Err(e) = wayland_app.render_frame(&frame_data.frame, frame_data.width, frame_data.height) {
+                if let Err(e) =
+                    wayland_app.render_frame(&frame_data.frame, frame_data.width, frame_data.height)
+                {
                     error!("Failed to render frame: {}", e);
                 }
 
@@ -390,10 +428,16 @@ async fn render_frames_async(
                 // Log every 30 frames
                 if frame_count % 30 == 0 {
                     let total_elapsed = start_time.elapsed();
-                    info!("Render {}: {}x{}, frame_time={}ms, render_time={:.2}ms, total_elapsed={:.2}s, FPS={:.2}",
-                          frame_count, frame_data.width, frame_data.height,
-                          frame_data.frame_time, render_time.as_secs_f64() * 1000.0,
-                          total_elapsed.as_secs_f64(), fps);
+                    info!(
+                        "Render {}: {}x{}, frame_time={}ms, render_time={:.2}ms, total_elapsed={:.2}s, FPS={:.2}",
+                        frame_count,
+                        frame_data.width,
+                        frame_data.height,
+                        frame_data.frame_time,
+                        render_time.as_secs_f64() * 1000.0,
+                        total_elapsed.as_secs_f64(),
+                        fps
+                    );
                 }
 
                 // Calculate when next frame should be displayed based on video frame time
@@ -419,5 +463,8 @@ async fn render_frames_async(
         }
     }
 
-    info!("Render thread stopped, total frames rendered: {}", frame_count);
+    info!(
+        "Render thread stopped, total frames rendered: {}",
+        frame_count
+    );
 }
