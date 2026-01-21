@@ -4,6 +4,10 @@ A dynamic wallpaper application for Wayland written in Rust, supporting video wa
 
 > **Note**: Most of the code in this project was generated with AI assistance.
 
+## Project Goal
+
+This project aims to implement Wallpaper Engine-like wallpaper playback functionality on Linux using Rust, allowing users to use Wallpaper Engine wallpaper resources on Linux.
+
 ## Features
 
 - ✅ **Video Wallpapers**: Support MP4 and other video formats as dynamic wallpapers
@@ -50,17 +54,20 @@ The daemon is a background service responsible for wallpaper rendering and playb
 # Start daemon
 ./target/release/daemon
 
-# Logs are written to /tmp/daemon.log
+# Logs are written to stdout, can be redirected
+./target/release/daemon > /tmp/daemon.log 2>&1
 ```
 
 ### Set Wallpaper
 
-Use the CLI tool to set wallpaper. Provide the directory path containing `project.json`.
+Use the CLI tool to set wallpaper. Provide the directory path containing `project.json`. This project is compatible with the format of Wallpaper Engine workshop downloads.
 
 ```bash
 # Set video wallpaper
 ./target/release/waypaper-rs set /path/to/wallpaper/directory
 ```
+
+**Note**: Wallpaper Engine workshop downloads typically include a `project.json` file and can be used directly.
 
 ### project.json Format
 
@@ -101,7 +108,7 @@ The wallpaper directory must contain a `project.json` file with the following fo
 ### Default Configuration
 
 - **Frame Rate**: 30 fps
-- **Resolution**: 720p (1280x720)
+- **Resolution**: 1080p (1920x1080)
 - **Hardware Acceleration**: VAAPI (Intel/AMD GPU)
 
 ### Custom Configuration
@@ -111,7 +118,7 @@ You can modify `VideoWallpaper` configuration in the code:
 ```rust
 let mut wallpaper = VideoWallpaper::new(video_path, WallpaperType::Video);
 wallpaper.set_target_fps(60);  // Set to 60fps
-wallpaper.set_max_resolution(1920, 1080);  // Set to 1080p
+wallpaper.set_max_resolution(2560, 1440);  // Set to 2K
 ```
 
 ## Architecture Design

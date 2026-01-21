@@ -4,6 +4,10 @@
 
 > **注意**：本项目的大部分代码由 AI 辅助生成。
 
+## 项目目标
+
+本项目旨在用 Rust 在 Linux 上实现类似 Wallpaper Engine 的壁纸播放功能，让用户能够在 Linux 上使用 Wallpaper Engine 的壁纸资源。
+
 ## 功能特性
 
 - ✅ **视频壁纸**：支持 MP4 等视频格式作为动态壁纸
@@ -50,17 +54,20 @@ Daemon 是后台服务，负责壁纸的渲染和播放。
 # 启动 daemon
 ./target/release/daemon
 
-# 日志会输出到 /tmp/daemon.log
+# 日志输出到标准输出，可通过重定向保存
+./target/release/daemon > /tmp/daemon.log 2>&1
 ```
 
 ### 设置壁纸
 
-使用 CLI 工具设置壁纸。传入包含 `project.json` 的目录路径。
+使用 CLI 工具设置壁纸。传入包含 `project.json` 的目录路径。本项目兼容 Wallpaper Engine 的 workshop 下载内容格式。
 
 ```bash
 # 设置视频壁纸
 ./target/release/waypaper-rs set /path/to/wallpaper/directory
 ```
+
+**注意**：Wallpaper Engine 的 workshop 下载内容通常包含 `project.json` 文件，可以直接使用。
 
 ### project.json 格式
 
@@ -101,7 +108,7 @@ Daemon 是后台服务，负责壁纸的渲染和播放。
 ### 默认配置
 
 - **帧率**：30 fps
-- **分辨率**：720p (1280x720)
+- **分辨率**：1080p (1920x1080)
 - **硬件加速**：VAAPI (Intel/AMD GPU)
 
 ### 自定义配置
@@ -111,7 +118,7 @@ Daemon 是后台服务，负责壁纸的渲染和播放。
 ```rust
 let mut wallpaper = VideoWallpaper::new(video_path, WallpaperType::Video);
 wallpaper.set_target_fps(60);  // 设置为 60fps
-wallpaper.set_max_resolution(1920, 1080);  // 设置为 1080p
+wallpaper.set_max_resolution(2560, 1440);  // 设置为 2K
 ```
 
 ## 架构设计
