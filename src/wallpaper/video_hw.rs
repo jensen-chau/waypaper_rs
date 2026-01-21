@@ -373,11 +373,13 @@ async fn decode_video_async(
             let mut first_frame_decoded = false;
 
             loop {
-                if *is_stopped.lock().await {
+                // 每 100 帧才检查一次 stop 标志，减少锁竞争
+                if frame_count % 100 == 0 && *is_stopped.lock().await {
                     info!("Decode thread stopped");
                     break Ok(());
                 }
 
+                // 每 10 帧检查一次暂停标志
                 if frame_count % 10 == 0 && *is_paused.lock().await {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
@@ -543,25 +545,18 @@ fn extract_frame_data(
 
     let width = width as usize;
     let height = height as usize;
-    let mut frame_data = vec![0u8; width * height * 4];
+    let row_size = width * 4;
+    let mut frame_data = vec![0u8; row_size * height];
 
     unsafe {
         let src_ptr = data.as_ptr();
         let dst_ptr = frame_data.as_mut_ptr();
 
+        // 使用 memcpy 逐行拷贝，比逐像素拷贝快得多
         for y in 0..height {
-            let src_row_start = y * stride;
-            let dst_row_start = y * width * 4;
-
-            for x in 0..width {
-                let src_idx = src_row_start + x * 4;
-                let dst_idx = dst_row_start + x * 4;
-
-                *dst_ptr.add(dst_idx) = *src_ptr.add(src_idx); // B
-                *dst_ptr.add(dst_idx + 1) = *src_ptr.add(src_idx + 1); // G
-                *dst_ptr.add(dst_idx + 2) = *src_ptr.add(src_idx + 2); // R
-                *dst_ptr.add(dst_idx + 3) = *src_ptr.add(src_idx + 3); // A
-            }
+            let src_row = src_ptr.add(y * stride);
+            let dst_row = dst_ptr.add(y * row_size);
+            std::ptr::copy_nonoverlapping(src_row, dst_row, row_size);
         }
     }
 
@@ -591,13 +586,14 @@ async fn render_frames_async(
 
     while !*is_stopped.lock().await {
         if *is_paused.lock().await {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            // 暂停时使用更长的 sleep 时间，减少 CPU 占用
+            tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         }
 
-        let recv_start = std::time::Instant::now();
-        match tokio::time::timeout(Duration::from_millis(1), rx.recv()).await {
-            Ok(Some(frame_data)) => {
+        // 使用阻塞 recv() 而不是 timeout，减少轮询
+        match rx.recv().await {
+            Some(frame_data) => {
                 frame_count += 1;
 
                 if frame_data.frame_time == 33 && frame_count > 100 {
@@ -673,12 +669,9 @@ async fn render_frames_async(
                     tokio::time::sleep(sleep_time).await;
                 }
             }
-            Ok(None) => {
+            None => {
                 info!("Decode thread disconnected");
                 break;
-            }
-            Err(_) => {
-                continue;
             }
         }
     }
