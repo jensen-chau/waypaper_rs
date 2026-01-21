@@ -22,4 +22,4 @@ wayland-protocols-wlr = { version = "0.3.5", features = ["client"] }
 wayland-scanner = "0.31.0"
 memmap2 = "0.9"
 tempfile = "3"
-ffmpeg-next = { version = "8", features = ["codec", "filter", "software-scaling"] }
+ffmpeg-next = { version = "8", features = ["codec", "filter", "software-scaling", "format"] }

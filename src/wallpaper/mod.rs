@@ -3,6 +3,7 @@ use anyhow::Result;
 
 pub mod web;
 pub mod video;
+pub mod video_hw;
 pub mod project;
 
 #[derive(Debug, thiserror::Error)]
