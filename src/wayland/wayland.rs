@@ -11,6 +11,7 @@ use wayland_client::{
     globals::{GlobalListContents, registry_queue_init},
 };
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
+use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 
 pub struct WaylandApp {
     pub conn: Connection,
@@ -31,10 +32,13 @@ pub struct WaylandApp {
     pub configured: bool,
     pub configured_width: u32,
     pub configured_height: u32,
-pub frame_count: u64,
+    pub frame_count: u64,
     pub pool_size: i32,
     pub output_width: u32,
     pub output_height: u32,
+    // Viewporter 支持
+    pub viewporter: Option<wp_viewporter::WpViewporter>,
+    pub viewport: Option<wp_viewport::WpViewport>,
 }
 
 // 实现 Send 以便在异步任务中使用
@@ -71,6 +75,8 @@ impl WaylandApp {
             pool_size,
             output_width: 1920, // Default to 1920x1080
             output_height: 1080,
+            viewporter: None,
+            viewport: None,
         };
         
         // Create event queue
@@ -150,6 +156,12 @@ impl WaylandApp {
         layer_surface.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
         
         surface.commit();
+        
+        // 创建 viewport（如果支持）
+        if let Some(ref viewporter) = app.viewporter {
+            app.viewport = Some(viewporter.get_viewport(&surface, &qh, ()));
+            log::info!("Created viewport for surface");
+        }
         
         // Wait for configure
         iterations = 0;
@@ -232,9 +244,17 @@ impl WaylandApp {
         let commit_start = std::time::Instant::now();
         surface.attach(Some(&buffer), 0, 0);
         
-        // 设置 surface 的源矩形（整个视频帧）
-        // 和目标矩形（整个屏幕）
-        surface.set_buffer_scale(1);
+        // 如果支持 viewporter，使用它来设置源和目标矩形
+        if let Some(ref viewport) = self.viewport {
+            // 设置源矩形（整个视频帧）
+            viewport.set_source(0.0, 0.0, width as f64, height as f64);
+            // 设置目标矩形（整个屏幕）
+            viewport.set_destination(self.output_width as i32, self.output_height as i32);
+        } else {
+            // 回退到传统的缩放方式
+            surface.set_buffer_scale(1);
+        }
+        
         surface.damage(0, 0, width as i32, height as i32);
         surface.commit();
         let commit_time = commit_start.elapsed();
@@ -385,6 +405,30 @@ impl Dispatch<zwlr_layer_shell_v1::ZwlrLayerShellV1, ()> for WaylandApp {
     }
 }
 
+impl Dispatch<wp_viewporter::WpViewporter, ()> for WaylandApp {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wp_viewporter::WpViewporter,
+        _event: wp_viewporter::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wp_viewport::WpViewport, ()> for WaylandApp {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wp_viewport::WpViewport,
+        _event: wp_viewport::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
 impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for WaylandApp {
     fn event(
         state: &mut Self,
@@ -458,6 +502,15 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandApp {
                         // Bind output to get display size information
                         let _output = registry.bind::<wl_output::WlOutput, _, _>(name, 4, qhandle, ());
                         log::info!("Bound wl_output");
+                    }
+                    "wp_viewporter" => {
+                        state.viewporter = Some(registry.bind::<wp_viewporter::WpViewporter, _, _>(
+                            name,
+                            1,
+                            qhandle,
+                            (),
+                        ));
+                        log::info!("Bound wp_viewporter");
                     }
                     _ => {}
                 }
