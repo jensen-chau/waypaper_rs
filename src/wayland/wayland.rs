@@ -231,6 +231,10 @@ impl WaylandApp {
         // Attach and commit
         let commit_start = std::time::Instant::now();
         surface.attach(Some(&buffer), 0, 0);
+        
+        // 设置 surface 的源矩形（整个视频帧）
+        // 和目标矩形（整个屏幕）
+        surface.set_buffer_scale(1);
         surface.damage(0, 0, width as i32, height as i32);
         surface.commit();
         let commit_time = commit_start.elapsed();

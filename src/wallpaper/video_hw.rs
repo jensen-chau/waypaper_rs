@@ -532,9 +532,9 @@ async fn decode_video_async(
 ) -> Result<()> {
     info!("decode_video_async started with hardware acceleration: {:?}", hw_accel_type);
     let video_path = video_path.to_string();
-    // 不再强制缩放，让 Wayland 合成器处理缩放
-    let output_width = 0u32;  // 0 表示使用原始尺寸
-    let output_height = 0u32;
+    // 使用合理的输出尺寸，避免 Wayland 合成器处理过大尺寸
+    let output_width = 1920u32;
+    let output_height = 1080u32;
 
     tokio::task::spawn_blocking::<_, Result<()>>(move || {
         info!("spawn_blocking thread started");
@@ -576,8 +576,8 @@ async fn decode_video_async(
         hw_decoder.configure_decoder(&mut decoder)?;
         info!("Hardware decoder configured: {:?}", hw_accel_type);
 
-        info!("Video opened: {}x{} (BGRA), Wayland will handle scaling",
-              decoder.width(), decoder.height());
+        info!("Video opened: {}x{} -> {}x{} (BGRA)",
+              decoder.width(), decoder.height(), output_width, output_height);
 
         let mut frame_count = 0u64;
         let mut last_pts: Option<i64> = None;
@@ -592,8 +592,9 @@ async fn decode_video_async(
             info!("Starting decode loop...");
             let mut packet_count = 0u64;
 
-            // 不使用缩放器,让 Wayland 合成器处理缩放
-            let mut first_decoded = false;
+            // 使用软件缩放器
+            let mut scaler: Option<Context> = None;
+            let mut first_frame_decoded = false;
 
             loop {
                 // 每 100 帧才检查一次 stop 标志，减少锁竞争
@@ -660,47 +661,76 @@ let bgra_frame = if is_hw_frame {
                                 // 传输硬件帧到软件帧
                                 let mut sw_frame = Video::empty();
                                 hw_decoder.transfer_frame(&decoded, &mut sw_frame)?;
+                                
+                                // 在第一帧传输后创建缩放器
+                                if !first_frame_decoded {
+                                    let sw_format = sw_frame.format();
+                                    let sw_width = sw_frame.width();
+                                    let sw_height = sw_frame.height();
+                                    info!("Creating scaler for software frame: {}x{} format: {:?}", sw_width, sw_height, sw_format);
+
+                                    // 如果尺寸相同，不创建缩放器
+                                    if sw_width == output_width && sw_height == output_height && sw_format == ffmpeg::format::Pixel::BGRA {
+                                        info!("No scaling needed, dimensions and format match");
+                                        first_frame_decoded = true;
+                                    } else {
+                                        scaler = Some(Context::get(
+                                            sw_format,
+                                            sw_width,
+                                            sw_height,
+                                            ffmpeg::format::Pixel::BGRA,
+                                            output_width,
+                                            output_height,
+                                            Flags::FAST_BILINEAR, // 使用更快的算法
+                                        ).map_err(|e| anyhow::anyhow!("Failed to create scaler: {}", e))?);
+                                        first_frame_decoded = true;
+                                    }
+                                }
+                                
                                 sw_frame
                             } else {
-                                // 已经是软件帧，直接使用
+                                // 如果已经是软件帧，检查是否需要缩放
+                                if !first_frame_decoded {
+                                    let sw_format = decoded.format();
+                                    let sw_width = decoded.width();
+                                    let sw_height = decoded.height();
+                                    info!("Creating scaler for software frame: {}x{} format: {:?}", sw_width, sw_height, sw_format);
+
+                                    // 如果尺寸相同，不创建缩放器
+                                    if sw_width == output_width && sw_height == output_height && sw_format == ffmpeg::format::Pixel::BGRA {
+                                        info!("No scaling needed, dimensions and format match");
+                                        first_frame_decoded = true;
+                                    } else {
+                                        scaler = Some(Context::get(
+                                            sw_format,
+                                            sw_width,
+                                            sw_height,
+                                            ffmpeg::format::Pixel::BGRA,
+                                            output_width,
+                                            output_height,
+                                            Flags::FAST_BILINEAR, // 使用更快的算法
+                                        ).map_err(|e| anyhow::anyhow!("Failed to create scaler: {}", e))?);
+                                        first_frame_decoded = true;
+                                    }
+                                }
                                 decoded
                             };
 
-                            // 转换为 BGRA 格式（如果还不是）
-                            let mut bgra_frame_converted = Video::empty();
-                            if bgra_frame.format() != ffmpeg::format::Pixel::BGRA {
-                                let sw_format = bgra_frame.format();
-                                let sw_width = bgra_frame.width();
-                                let sw_height = bgra_frame.height();
-                                
-                                if !first_decoded {
-                                    info!("Converting from {:?} to BGRA", sw_format);
-                                    first_decoded = true;
-                                }
-                                
-                                let mut converter = Context::get(
-                                    sw_format,
-                                    sw_width,
-                                    sw_height,
-                                    ffmpeg::format::Pixel::BGRA,
-                                    sw_width,
-                                    sw_height,
-                                    Flags::FAST_BILINEAR,
-                                ).map_err(|e| anyhow::anyhow!("Failed to create format converter: {}", e))?;
-                                converter.run(&bgra_frame, &mut bgra_frame_converted)
-                                    .map_err(|e| anyhow::anyhow!("Failed to convert frame format: {}", e))?;
+                            // Scale and convert frame to BGRA
+                            let mut final_bgra_frame = Video::empty();
+                            if let Some(ref mut scaler) = scaler {
+                                scaler.run(&bgra_frame, &mut final_bgra_frame)
+                                    .map_err(|e| anyhow::anyhow!("Failed to scale frame: {}", e))?;
                             } else {
-                                bgra_frame_converted = bgra_frame;
+                                // No scaler needed, use as-is
+                                final_bgra_frame = bgra_frame;
                             }
 
-                            // 使用原始尺寸，让 Wayland 合成器处理缩放
-                            let frame_width = bgra_frame_converted.width();
-                            let frame_height = bgra_frame_converted.height();
-                            let frame_data = extract_frame_data(&bgra_frame_converted, frame_width, frame_height)?;
+                            let frame_data = extract_frame_data(&final_bgra_frame, output_width, output_height)?;
 
                             if frame_count % 60 == 0 {
                                 info!("Frame {} - {}x{} - Hardware: {}",
-                                      frame_count, frame_width, frame_height, is_hw_frame);
+                                      frame_count, output_width, output_height, is_hw_frame);
                             }
 
                             if let Some(last) = last_pts {
@@ -714,8 +744,8 @@ let bgra_frame = if is_hw_frame {
 
                             let frame_data = FrameData {
                                 frame: frame_data,
-                                width: frame_width,
-                                height: frame_height,
+                                width: output_width,
+                                height: output_height,
                                 frame_time: frame_time_ms,
                             };
 
