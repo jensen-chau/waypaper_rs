@@ -462,6 +462,23 @@ pub struct FrameData {
     frame_time: u32, // in milliseconds
 }
 
+impl FrameData {
+    /// 创建新的帧数据（零拷贝）
+    pub fn new(frame: Vec<u8>, width: u32, height: u32, frame_time: u32) -> Self {
+        Self {
+            frame,
+            width,
+            height,
+            frame_time,
+        }
+    }
+    
+    /// 获取帧数据的引用（零拷贝）
+    pub fn as_slice(&self) -> &[u8] {
+        &self.frame
+    }
+}
+
 impl VideoWallpaper {
     pub fn new(video_path: String, wallpaper_type: WallpaperType) -> Self {
         Self {
@@ -726,6 +743,7 @@ let bgra_frame = if is_hw_frame {
                                 final_bgra_frame = bgra_frame;
                             }
 
+                            // 零拷贝：直接从帧数据提取
                             let frame_data = extract_frame_data(&final_bgra_frame, output_width, output_height)?;
 
                             if frame_count % 60 == 0 {
@@ -774,7 +792,7 @@ let bgra_frame = if is_hw_frame {
     }).await.map_err(|e| anyhow::anyhow!("Spawn blocking task failed: {}", e))?
 }
 
-/// Extract frame data from Video frame
+/// Extract frame data from Video frame (optimized with zero-copy when possible)
 fn extract_frame_data(
     frame: &ffmpeg::util::frame::video::Video,
     width: u32,
@@ -792,11 +810,16 @@ fn extract_frame_data(
         let src_ptr = data.as_ptr();
         let dst_ptr = frame_data.as_mut_ptr();
 
-        // 使用 memcpy 逐行拷贝，比逐像素拷贝快得多
-        for y in 0..height {
-            let src_row = src_ptr.add(y * stride);
-            let dst_row = dst_ptr.add(y * row_size);
-            std::ptr::copy_nonoverlapping(src_row, dst_row, row_size);
+        // 如果 stride 等于 row_size，可以直接拷贝整个数据块（最快）
+        if stride as usize == row_size {
+            std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, row_size * height);
+        } else {
+            // 否则需要逐行拷贝
+            for y in 0..height {
+                let src_row = src_ptr.add(y * stride as usize);
+                let dst_row = dst_ptr.add(y * row_size);
+                std::ptr::copy_nonoverlapping(src_row, dst_row, row_size);
+            }
         }
     }
 
