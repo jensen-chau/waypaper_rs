@@ -5,6 +5,7 @@ pub mod web;
 pub mod video;
 pub mod video_hw;
 pub mod project;
+pub mod player;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WallpaperError {
@@ -19,6 +20,7 @@ pub trait Wallpaper {
     fn info(&self);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WallpaperType {
     Video,
     Web,

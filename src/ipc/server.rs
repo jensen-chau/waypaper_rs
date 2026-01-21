@@ -7,17 +7,14 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
 use crate::ipc::protocol::{IpcRequest, IpcResponse};
-
-/// 服务器状态
-#[derive(Debug, Default)]
-struct ServerState {
-    current_wallpaper: Option<String>,
-    running: bool,
-}
+use crate::wallpaper::player::Player;
+use crate::wallpaper::{Wallpaper, WallpaperType};
+use crate::wallpaper::video_hw::VideoWallpaper;
+use crate::wallpaper::project::build_project;
 
 pub struct WayServer {
     listener: UnixListener,
-    state: Arc<Mutex<ServerState>>,
+    player: Arc<Mutex<Player>>,
 }
 
 impl WayServer {
@@ -25,12 +22,9 @@ impl WayServer {
         let listener = UnixListener::bind(path)
             .context("Failed to bind Unix socket")?;
 
-        let state = Arc::new(Mutex::new(ServerState {
-            current_wallpaper: None,
-            running: true,
-        }));
+        let player = Arc::new(Mutex::new(Player::new()));
 
-        Ok(WayServer { listener, state })
+        Ok(WayServer { listener, player })
     }
 
     pub async fn run(&self) -> Result<()> {
@@ -39,9 +33,9 @@ impl WayServer {
         loop {
             match self.listener.accept().await {
                 Ok((stream, _addr)) => {
-                    let state = self.state.clone();
+                    let player = self.player.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_client(stream, state).await {
+                        if let Err(e) = handle_client(stream, player).await {
                             error!("Error handling client: {}", e);
                         }
                     });
@@ -56,7 +50,7 @@ impl WayServer {
 
 async fn handle_client(
     mut stream: UnixStream,
-    state: Arc<Mutex<ServerState>>,
+    player: Arc<Mutex<Player>>,
 ) -> Result<()> {
     let request_len = stream
         .read_u32()
@@ -74,7 +68,7 @@ async fn handle_client(
 
     info!("Receive command {:#?}", request);
 
-    let response = handle_request(request, &state).await;
+    let response = handle_request(request, &player).await;
 
     let response_json = serde_json::to_string(&response)
         .context("Failed to serialize response")?;
@@ -96,26 +90,75 @@ async fn handle_client(
 
 async fn handle_request(
     request: IpcRequest,
-    state: &Arc<Mutex<ServerState>>,
+    player: &Arc<Mutex<Player>>,
 ) -> IpcResponse {
     match request {
         IpcRequest::SetWallpaper { path } => {
-            // TODO: 实际设置壁纸的逻辑
-            let mut state = state.lock().await;
-            state.current_wallpaper = Some(path.clone());
-            IpcResponse::success(format!("Wallpaper set: {}", path))
+            // 检查文件是否存在
+            if !std::path::Path::new(&path).exists() {
+                return IpcResponse::error(format!("File not found: {}", path));
+            }
+
+            // 读取 project.json
+            let project_dir = std::path::Path::new(&path).parent()
+                .unwrap_or_else(|| std::path::Path::new(""));
+            let project_json_path = project_dir.join("project.json");
+            
+            let project_json_path_str = project_json_path.to_str()
+                .unwrap_or_else(|| {
+                    error!("Failed to convert project.json path to string");
+                    return "";
+                });
+
+            let project = match build_project(project_json_path_str) {
+                Ok(p) => p,
+                Err(e) => {
+                    error!("Failed to load project.json: {}", e);
+                    return IpcResponse::error(format!("Failed to load project.json: {}", e));
+                }
+            };
+
+            // 根据 project.json 创建相应的壁纸实例
+            let wallpaper: Box<dyn Wallpaper + Send> = match project.wallpaper_type.to_lowercase().as_str() {
+                "video" => {
+                    let mut video_wallpaper = VideoWallpaper::new(path.clone(), WallpaperType::Video);
+                    // 设置性能优化参数
+                    video_wallpaper.set_target_fps(30);
+                    video_wallpaper.set_max_resolution(1280, 720);
+                    Box::new(video_wallpaper)
+                }
+                _ => {
+                    return IpcResponse::error(format!("Unsupported wallpaper type: {}", project.wallpaper_type));
+                }
+            };
+
+            // 设置到 player
+            {
+                let mut player = player.lock().await;
+                player.set_wallpaper(wallpaper);
+                player.run();
+            }
+
+            info!("Wallpaper set: {} (type: {})", path, project.wallpaper_type);
+            IpcResponse::success(format!("Wallpaper set: {} ({})", path, project.wallpaper_type))
         }
         IpcRequest::GetWallpaper => {
-            let state = state.lock().await;
-            IpcResponse::wallpaper_path(state.current_wallpaper.clone())
+            let player = player.lock().await;
+            let is_running = player.is_running();
+            IpcResponse::success(format!("Player status: {}", if is_running { "Running" } else { "Stopped" }))
         }
         IpcRequest::GetStatus => {
-            let state = state.lock().await;
-            IpcResponse::status(state.running)
+            let player = player.lock().await;
+            let is_running = player.is_running();
+            IpcResponse::status(is_running)
         }
         IpcRequest::Shutdown => {
-            let mut state = state.lock().await;
-            state.running = false;
+            // 停止壁纸
+            {
+                let mut player = player.lock().await;
+                player.stop();
+                player.clear();
+            }
             IpcResponse::success("Server is closing".to_string())
         }
     }
