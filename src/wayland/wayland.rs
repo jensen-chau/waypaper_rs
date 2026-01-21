@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{Seek, Write};
 use std::os::unix::io::{AsFd, AsRawFd};
 use wayland_client::protocol::{
-    wl_buffer, wl_compositor, wl_display, wl_output, wl_registry, wl_seat, wl_shm, wl_shm_pool,
+    wl_buffer, wl_callback, wl_compositor, wl_display, wl_output, wl_registry, wl_seat, wl_shm, wl_shm_pool,
     wl_surface,
 };
 use wayland_client::{
@@ -35,7 +35,6 @@ pub struct WaylandApp {
     pub pool_size: i32,
     pub output_width: u32,
     pub output_height: u32,
-    pub needs_dispatch: bool, // 标记是否需要 dispatch
 }
 
 // 实现 Send 以便在异步任务中使用
@@ -72,7 +71,6 @@ impl WaylandApp {
             pool_size,
             output_width: 1920, // Default to 1920x1080
             output_height: 1080,
-            needs_dispatch: false,
         };
         
         // Create event queue
@@ -186,24 +184,19 @@ impl WaylandApp {
             return Err(anyhow::anyhow!("Frame size {} exceeds pool size {}", size, self.pool_size));
         }
 
-        // 使用 mmap 直接写入内存，避免系统调用
-        let write_start = std::time::Instant::now();
+        // 使用 mmap 直接写入内存
         if let Some(shm_data) = self.shm_data {
             unsafe {
                 let dst_ptr = shm_data as *mut u8;
                 let src_ptr = frame_data.as_ptr();
-                // 使用 memcpy 直接拷贝到 mmap 区域
                 std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, size as usize);
             }
         }
-        let write_time = write_start.elapsed();
 
-        // 使用三缓冲：获取当前 buffer，如果不存在则创建
-        let buffer_start = std::time::Instant::now();
+        // 获取或创建 buffer
         let buffer = if let Some(ref buf) = self.buffers[self.current_buffer_index] {
             buf.clone()
         } else {
-            // 创建新的 buffer
             let new_buffer = shm_pool.create_buffer(
                 0,
                 width as i32,
@@ -216,51 +209,25 @@ impl WaylandApp {
             self.buffers[self.current_buffer_index] = Some(new_buffer.clone());
             new_buffer
         };
-        let buffer_time = buffer_start.elapsed();
 
-        // 切换到下一个 buffer
         self.current_buffer_index = (self.current_buffer_index + 1) % self.buffers.len();
 
-        // Debug: log first few pixels (BGRA format) every 30 frames
-        self.frame_count += 1;
-        if self.frame_count % 30 == 0 {
-            log::info!("Frame {} - {}x{} - First 2 pixels (BGRA): B={}, G={}, R={}, A={}, B={}, G={}, R={}, A={}",
-                     self.frame_count, width, height,
-                     frame_data[0], frame_data[1], frame_data[2], frame_data[3],
-                     frame_data[4], frame_data[5], frame_data[6], frame_data[7]);
-        }
-
         // Attach and commit
-        let commit_start = std::time::Instant::now();
         surface.attach(Some(&buffer), 0, 0);
         surface.damage(0, 0, width as i32, height as i32);
         surface.commit();
-        let commit_time = commit_start.elapsed();
 
-        // 标记需要 dispatch
-        self.needs_dispatch = true;
-
-        // Log timing every 30 frames
-        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        if count % 30 == 0 {
-            log::info!("Render timing: mmap_write={:.2}ms, buffer_get={:.2}ms, commit={:.2}ms",
-                     write_time.as_secs_f64() * 1000.0,
-                     buffer_time.as_secs_f64() * 1000.0,
-                     commit_time.as_secs_f64() * 1000.0);
-        }
+        self.frame_count += 1;
 
         Ok(())
     }
 
     pub fn dispatch_events(&mut self) -> Result<()> {
-        // 只在标记需要 dispatch 时才调用
-        if self.needs_dispatch && self.queue.is_some() {
-            // Take the queue temporarily to avoid borrow issues
+        if self.queue.is_some() {
             let mut queue = self.queue.take().unwrap();
-            let result = queue.roundtrip(self);
+            // 使用 dispatch_pending 避免阻塞
+            let result = queue.dispatch_pending(self);
             self.queue = Some(queue);
-            self.needs_dispatch = false; // 重置标记
             result.map_err(|e| anyhow::anyhow!("Failed to dispatch events: {}", e))?;
         }
         Ok(())
