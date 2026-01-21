@@ -36,6 +36,7 @@ pub struct WaylandApp {
     pub output_width: u32,
     pub output_height: u32,
     pub needs_dispatch: bool, // 标记是否需要 dispatch
+    pub dispatch_counter: u32, // dispatch 计数器
 }
 
 // 实现 Send 以便在异步任务中使用
@@ -73,6 +74,7 @@ impl WaylandApp {
             output_width: 1920, // Default to 1920x1080
             output_height: 1080,
             needs_dispatch: false,
+            dispatch_counter: 0,
         };
         
         // Create event queue
@@ -254,13 +256,12 @@ impl WaylandApp {
     }
 
     pub fn dispatch_events(&mut self) -> Result<()> {
-        // 只在标记需要 dispatch 时才调用
-        if self.needs_dispatch && self.queue.is_some() {
-            // Take the queue temporarily to avoid borrow issues
+        // 每 5 帧才 dispatch 一次，减少 CPU 占用
+        self.dispatch_counter += 1;
+        if self.dispatch_counter % 5 == 0 && self.queue.is_some() {
             let mut queue = self.queue.take().unwrap();
             let result = queue.roundtrip(self);
             self.queue = Some(queue);
-            self.needs_dispatch = false; // 重置标记
             result.map_err(|e| anyhow::anyhow!("Failed to dispatch events: {}", e))?;
         }
         Ok(())
